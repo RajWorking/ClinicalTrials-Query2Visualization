@@ -1,0 +1,5 @@
+{
+  "query": "Does enrollment size correlate with trial duration for cardiology trials?",
+  "condition": "Cardiovascular Disease",
+  "max_studies": 800
+}

@@ -1,0 +1,5 @@
+{
+  "query": "How are trials for this condition distributed across phases?",
+  "condition": "Glioblastoma",
+  "max_studies": 600
+}

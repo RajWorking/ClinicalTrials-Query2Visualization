@@ -1,0 +1,7 @@
+{
+  "query": "How has the number of trials for this drug changed per year since 2015?",
+  "drug_name": "Pembrolizumab",
+  "start_year": 2015,
+  "end_year": 2025,
+  "max_studies": 800
+}

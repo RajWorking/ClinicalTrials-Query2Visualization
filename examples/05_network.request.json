@@ -1,0 +1,5 @@
+{
+  "query": "Show a sponsor and drug network for melanoma trials.",
+  "condition": "Melanoma",
+  "max_studies": 400
+}

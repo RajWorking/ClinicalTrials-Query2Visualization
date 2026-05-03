@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Clinical Trials Query → Visualization</title>
+<link rel="stylesheet" href="/static/style.css" />
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Clinical Trials → Visualization</h1>
+  <p class="sub">Ask a question about ClinicalTrials.gov data. The backend returns a structured visualization spec which this page renders.</p>
+</header>
+
+<main>
+  <section id="form">
+    <label for="query">Query</label>
+    <textarea id="query" rows="3" placeholder="e.g. How has the number of pembrolizumab trials changed each year since 2015?"></textarea>
+    <div class="grid">
+      <label>Drug<input id="drug_name" /></label>
+      <label>Condition<input id="condition" /></label>
+      <label>Sponsor<input id="sponsor" /></label>
+      <label>Country<input id="country" /></label>
+      <label>Phase<input id="phase" placeholder="PHASE3" /></label>
+      <label>Status<input id="status" placeholder="RECRUITING" /></label>
+      <label>Start year<input id="start_year" type="number" /></label>
+      <label>End year<input id="end_year" type="number" /></label>
+      <label>Max studies<input id="max_studies" type="number" value="500" /></label>
+    </div>
+    <div class="examples">
+      <span>Try:</span>
+      <button data-q="How has the number of trials for Pembrolizumab changed per year since 2015?">trends</button>
+      <button data-q="How are diabetes trials distributed across phases?" data-cond="Diabetes">phases</button>
+      <button data-q="Compare Pembrolizumab vs Nivolumab by phase.">compare</button>
+      <button data-q="Which countries have the most recruiting trials for breast cancer?" data-cond="Breast Cancer" data-status="RECRUITING">geography</button>
+      <button data-q="Show a sponsor ↔ drug network for melanoma trials." data-cond="Melanoma">network</button>
+    </div>
+    <button id="run" class="primary">Analyze</button>
+  </section>
+
+  <section id="results" class="hidden">
+    <h2 id="title"></h2>
+    <p class="meta" id="interpretation"></p>
+    <div id="viz"></div>
+    <details id="raw"><summary>Raw response JSON</summary><pre id="raw-json"></pre></details>
+  </section>
+
+  <section id="status-area"></section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

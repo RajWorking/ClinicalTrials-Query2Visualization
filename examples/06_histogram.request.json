@@ -1,0 +1,5 @@
+{
+  "query": "What is the distribution of enrollment sizes for diabetes trials?",
+  "condition": "Type 2 Diabetes",
+  "max_studies": 800
+}
