@@ -49,9 +49,9 @@ curl -sS -X POST http://localhost:8000/analyze \
 ### Stub mode
 
 Set `STUB_LLM=1` to bypass OpenAI entirely. The planner uses hand-crafted
-plans for the five example query categories (time trends, distributions,
-comparisons, geography, networks). This lets graders run the full pipeline
-end-to-end without an OpenAI key.
+plans for the example query categories (time trends, distributions,
+comparisons, geography, networks, histograms, and scatter plots). This lets
+graders run the full pipeline end-to-end without an OpenAI key.
 
 ```bash
 STUB_LLM=1 ./run.sh
@@ -62,17 +62,27 @@ STUB_LLM=1 ./run.sh
 ```bash
 pytest -q                       # unit + integration (mocked CT.gov + mocked OpenAI)
 python -m scripts.smoke_ctgov   # live transport check against /version + /studies
-python -m scripts.smoke_analyze # live end-to-end /analyze on all 5 example queries
+python -m scripts.smoke_analyze # live end-to-end /analyze on all 7 example queries
+python -m scripts.smoke_analyze --write # refresh examples/*.response.json
 ```
 
-77 tests cover every aggregation builder, the stub planner's classification,
-schema validation (phase/status synonyms, year bounds), end-to-end
-`/analyze` integration via a mocked CT.gov client, the OpenAI planner
-path with a fake SDK (happy path / repair retry / fallback), and a
+142 tests cover every aggregation builder, the stub planner's classification
+(including stopword-aware condition extraction and X-vs-Y axis routing for
+phase / year / status / country / sponsor class), schema validation
+(phase/status/sponsor-class/study-type/sex/intervention-type synonyms,
+year bounds, discriminated visualization spec, typed per-viz datum rows),
+end-to-end `/analyze` integration via a mocked CT.gov client, the OpenAI
+planner path with a fake SDK (happy path / repair retry / fallback),
+small-enum exact fan-out across `sponsor_class` / `study_type` / `sex` /
+`intervention_type` (parametrized), candidate-discovery exact fan-out for
+sponsor / condition / intervention top-N, salt-form canonicalization and
+MeSH artifact filtering for the network builder, top-N clipping (bar and
+network), default-time-range surfacing, network-truncation warnings, and a
 recorded CT.gov payload played through the real httpx client. The
 `smoke_ctgov` script diagnoses transport issues (e.g. CDN-side `403`s);
 the `smoke_analyze` script runs each canonical example against the
-live API and prints actual vs. expected viz types.
+live API and prints actual vs. expected viz types. Pass `--write` to
+recapture the checked responses in `examples/*.response.json`.
 
 ---
 
@@ -99,13 +109,19 @@ the *shape* of the question — filters, aggregation dimension, viz type. All
 data fetching, counting, binning, and citation building is deterministic
 Python. Numbers are never hallucinated.
 
-| Stage      | Module             | What it does                                                                 |
-|------------|--------------------|------------------------------------------------------------------------------|
-| Plan       | `app/planner.py`   | OpenAI structured outputs (or `STUB_LLM=1` heuristic) → `QueryPlan` Pydantic |
-| Fetch      | `app/ctgov.py`     | Translates `Filters` → v2 API params, paginates, normalizes to flat dicts    |
-| Aggregate  | `app/aggregate.py` | One pure function per visualization type (`build_bar`, `build_network`, …)   |
-| Cite       | `app/citations.py` | Picks NCT ID + brief-title excerpt per bucket / edge                          |
-| Respond    | `app/main.py`      | Assembles `AnalyzeResponse` and serves it                                    |
+| Stage      | Module                  | What it does                                                                 |
+|------------|-------------------------|------------------------------------------------------------------------------|
+| Route      | `app/main.py`           | FastAPI setup, error mapping, `/analyze` orchestration                        |
+| Plan       | `app/planner.py`        | OpenAI call/repair/fallback and `STUB_LLM=1` composition                     |
+| Extract    | `app/nl_extract.py`     | Deterministic stub-mode condition/year/axis/network routing helpers          |
+| Validate   | `app/plan_verifier.py`  | Post-plan deterministic intent checks and off-topic safe-default guard       |
+| Schema     | `app/planner_schema.py` | OpenAI structured-output prompt + strict JSON schema                         |
+| Fetch      | `app/ctgov.py`          | Translates `Filters` → v2 API params, paginates, normalizes to flat dicts    |
+| Execute    | `app/paths.py`          | Selects exact/sampled execution path and returns `PathOutcome`                |
+| Exact      | `app/exact_counts.py`   | Shared countTotal fan-out helpers for small enums, countries, years, cells   |
+| Aggregate  | `app/aggregate.py`      | Pure builders for sampled bar/time/histogram/scatter/network outputs         |
+| Cite       | `app/citations.py`      | Picks NCT ID + brief-title excerpt per bucket / edge                         |
+| Respond    | `app/responses.py`      | Top-N clipping, warnings, and `AnalyzeResponse` assembly                     |
 
 ---
 
@@ -122,14 +138,48 @@ Python. Numbers are never hallucinated.
 | `country`     | string?  | no       | Maps to `query.locn`                                   |
 | `phase`       | string?  | no       | One of `PHASE1`, `PHASE2`, `PHASE3`, `PHASE4`, `EARLY_PHASE1`, `NA` |
 | `status`      | string?  | no       | e.g. `RECRUITING`, `COMPLETED`, `TERMINATED`           |
+| `sponsor_class` | string? | no      | One of `INDUSTRY`, `NIH`, `FED`, `OTHER_GOV`, `INDIV`, `NETWORK`, `AMBIG`, `OTHER`, `UNKNOWN`; common phrases like `industry-sponsored` normalize to enum values |
+| `study_type`  | string?  | no       | One of `INTERVENTIONAL`, `OBSERVATIONAL`, `EXPANDED_ACCESS`; synonyms like `observational` are accepted |
+| `sex`         | string?  | no       | One of `ALL`, `FEMALE`, `MALE`; synonyms like `women` / `men` are accepted |
+| `intervention_type` | string? | no  | One of CT.gov's intervention-type enums such as `DRUG`, `BIOLOGICAL`, `DEVICE`, `PROCEDURE`, `DIAGNOSTIC_TEST` |
 | `start_year`  | int?     | no       | Lower bound for trial start date                       |
 | `end_year`    | int?     | no       | Upper bound for trial start date                       |
 | `max_studies` | int      | no       | Default 500, max 2000                                  |
+| `top_n`       | int?     | no       | If set (1–200), bar / grouped_bar / histogram / network output is clipped to the top-N highest-weight buckets / edges. Time series is unaffected. |
 
 Any structured field provided overrides anything the LLM picks for that
 filter.
 
 ## Response schema
+
+`visualization` is a Pydantic [discriminated union](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions)
+keyed on `type` — the generated OpenAPI schema lists one variant per
+visualization type, so consumers can dispatch on `type` without
+defending against absent fields. Chart types (`bar_chart`,
+`grouped_bar_chart`, `time_series`, `histogram`, `scatter_plot`) carry a
+`data: list[…]` and never `nodes`/`edges`. `network_graph` carries
+`nodes` and `edges` and never `data`.
+
+Frontend consumers can inspect the live OpenAPI document at
+`GET /openapi.json`. The `encoding` channels are typed in that schema
+while preserving the compact Vega-Lite-style JSON shape, e.g.
+`{"field":"phase","type":"nominal"}`.
+
+Each datum row is also a typed model — `BarDatum`, `GroupedBarDatum`,
+`TimeSeriesDatum`, `HistogramDatum`, `ScatterDatum`, `NetworkNode`,
+`NetworkEdge`. They share a uniform "support envelope" (`trial_count`,
+`sampled`, `supporting_nct_ids`, `supporting_nct_ids_complete`,
+`citation_count`, `citations`) and add what's specific to that chart
+shape (`bin_start`/`bin_end` for histograms, `nct_id` for scatter,
+`source`/`target`/`weight` for network edges, …). The dynamic dim-key
+field — `phase`, `country`, `sponsor`, `year`, … — is named after
+`aggregation.group_by` and flows through `model_extra`, so it can vary
+per request without weakening row-level validation.
+
+Spec models reject unexpected top-level fields and validate required
+rendering channels: chart specs require `encoding.x` + `encoding.y`,
+grouped bars also require `encoding.series`, and network graphs require
+`encoding.nodes` + `encoding.edges`.
 
 ```jsonc
 {
@@ -190,7 +240,7 @@ filter.
 | `time_series`       | Trend by year/quarter/month of trial start             | `[{year, trial_count, citations}]`                                    |
 | `histogram`         | Distribution of a numeric field (enrollment, duration) | `[{bin, bin_start, bin_end, trial_count, citations}]`                 |
 | `scatter_plot`      | Two numeric fields per trial                           | `[{<x>, <y>, nct_id, citations}]`                                     |
-| `network_graph`     | Relationships (sponsor↔drug, drug↔condition, drug↔drug)| `nodes: [{id,label,type}]`, `edges: [{source,target,weight,citations}]` |
+| `network_graph`     | Relationships (sponsor↔drug, drug↔condition, drug↔drug, site↔drug)| `nodes: [{id,label,type}]`, `edges: [{source,target,weight,citations}]` |
 
 Supported dimensions for grouping: `phase`, `overall_status`, `study_type`,
 `sex`, `lead_sponsor`, `sponsor_class`, `country`, `intervention_type`,
@@ -198,7 +248,7 @@ Supported dimensions for grouping: `phase`, `overall_status`, `study_type`,
 
 ## Example queries
 
-The five canonical queries, with captured input/output JSON pairs, live in
+Seven canonical queries, with captured input/output JSON pairs, live in
 [`examples/`](./examples). They cover every supported visualization type:
 
 | File prefix          | Query category    | Viz type            |
@@ -238,30 +288,79 @@ intentionally small and Vega-Lite-compatible, so the demo UI can render
 five chart types from one rendering function plus a network branch.
 
 **Citations on every datum.** `cite()` is called per bucket (per bar, per
-year, per edge), capped at 3 entries each. Excerpts come from
-`briefTitle` (with `briefSummary` fallback). This keeps the response
-under 100 KB even for high-cardinality queries while still being
-auditable — the assignment's bonus criterion.
+year, per edge), capped at **3 entries each** for payload-size reasons —
+the response stays under 100 KB even on high-cardinality queries while
+remaining auditable (the assignment's bonus criterion). Excerpts come
+from `briefTitle` with `briefSummary` fallback. The cited NCT IDs are a
+**stable representative sample** of the trials supporting that datum,
+not the full list. Two adjacent fields disambiguate that:
+
+  - `supporting_nct_ids` — the IDs the response carries for this datum.
+  - `supporting_nct_ids_complete` — `true` when the list is exhaustive
+    for the studies actually scanned (aggregator paths: bar-from-sample,
+    time series from per-year fan-out, scatter), `false` when the list
+    is only a small citation sample (exact-count fan-out paths return
+    the API's `totalCount` but only fetch a few studies for citations).
+  - `citation_count` — the count the trial_count reflects (always exact
+    on fan-out paths; equals `len(supporting_nct_ids)` on aggregator
+    paths).
+
+So a reviewer can tell whether "more IDs exist beyond what's shown".
 
 **Override semantics.** Any structured field the user supplies wins over
 the LLM's guess. If the user says `condition=Glioblastoma`, that's the
-filter — even if the model tried to set something else.
+filter — even if the model tried to set something else. The same applies
+to CT.gov enum filters (`phase`, `status`, `sponsor_class`, `study_type`,
+`sex`, `intervention_type`), which are also inferred from clear phrases
+such as "Phase 3", "industry-sponsored", "observational", "female-only",
+and "biologic trials".
 
 **Stub mode.** A heuristic planner ships with the code so the pipeline
 can be evaluated without an OpenAI key. It also guards the test suite
 against LLM nondeterminism.
 
-**Exact counts where possible, sampled-and-labelled otherwise.** For
-`bar_chart` queries grouped by `phase` or `overall_status`, for
-`time_series` (per-year), and for `grouped_bar_chart` comparisons (one
-fan-out cell per series-value × bucket-value), the backend fans out tiny
-`countTotal=true` queries in parallel — giving exact counts with no
-sampling. For high-cardinality dimensions (country, sponsor, condition)
-we fall back to fetching up to `max_studies` (default 500); each datum
-carries `sampled: true`, the title gets a `(sampled)` suffix, and `meta`
-records `truncated: true` with a warning. We deliberately do **not**
-extrapolate to an estimated total — pagination is not a random sample, so
-scaling would produce biased numbers; sampled counts are lower bounds.
+**Exact counts where possible, sampled-and-labelled otherwise.** Each
+visualization request is dispatched to one of eight *path strategies*
+(`_path_year_fanout`, `_path_exact_bar`, `_path_high_card_bar`,
+`_path_exact_country_bar`, `_path_grouped_bar_cross`,
+`_path_grouped_compare_exact`, `_path_grouped_compare_sampled`,
+`_path_generic`) — each returns a `PathOutcome`, then `responses.py` runs
+the same post-processing on whatever the chosen path produced.
+
+- `phase`, `overall_status`, `sponsor_class`, `study_type`, `sex`, and
+  `intervention_type` bar_charts, `year` time_series, and X-vs-Y
+  comparisons over `phase` / `overall_status` / `sponsor_class` /
+  `study_type` / `sex` / `intervention_type` fan out **one tiny
+  `countTotal=true` query per bucket** in parallel — exact counts with
+  no sampling. The dims share a small enum, which is why we can
+  enumerate buckets up-front. Exact year time-series responses include
+  explicit zero-count rows for empty years, and exact grouped comparisons
+  include zero-count cells for every compared series × enum bucket.
+- For **country** group_by we enumerate a fixed CT.gov-compatible country
+  list and run one `countTotal=true` query per country. Shown country
+  counts are exact and can find a true leader outside the first result
+  window; citation IDs on each country are still a small sample.
+- For **sponsor / condition / intervention name** group_by we
+  candidate-discover from a broader high-cardinality scan window, then fan out one
+  `countTotal=true` per discovered candidate — so the trial counts on
+  shown buckets are *exact* (no sampling), but a candidate that appears
+  *only* in the unsampled portion of the result set is missing from the
+  ranking. The response surfaces this in `warnings` whenever it applies.
+- The remaining viz types (histogram, scatter, network, plus
+  quarter/month time-series) use the generic sample-then-aggregate path.
+  We bump the cap per viz type because each has different
+  representativeness needs: `CTGOV_NUMERIC_SCAN_CAP` (default 10000) for
+  histogram/scatter so the numeric distribution isn't skewed by
+  pagination order, `CTGOV_NETWORK_SCAN_CAP` (default 5000) for network
+  graphs so edge weights reflect more relationships. When the matched
+  total still exceeds these caps, each datum carries `sampled: true`,
+  the title gets a `(sampled)` suffix, and `meta` records `truncated:
+  true` with a warning. We deliberately do **not** extrapolate to an
+  estimated total — pagination is not a random sample, so scaling would
+  produce biased numbers; sampled counts are lower bounds. Scatter plots
+  also apply a display payload cap (`CTGOV_SCATTER_POINT_CAP`, default
+  1000) after scanning; when it clips points, `warnings` says the display
+  was capped while source scan metadata remains unchanged.
 
 For grouped comparisons, `meta.per_series_totals` reports each compared
 item's independent total. Trials that combine both compared items will
@@ -285,14 +384,32 @@ flags truncation when it occurs.
   - `url` — the canonical CT.gov study page
 
 So a reviewer can confirm not just *which* trial supports a datum but
-*which field on that trial*, and click through to the source.
+*which field on that trial*, and click through to the source. Network
+edge citations combine the structured fields that form the relationship
+(for example sponsor + intervention, site + intervention, or drug +
+condition) instead of falling back to only a trial title.
 
 **Network entity normalization.** Drug nodes are deduped via a canonical
 form: lowercased, with parentheticals, dosage values (`200 mg`,
-`5 mg/kg`), and dosage forms (`injection`, `tablet`, `oral`) stripped.
-So `Pembrolizumab`, `pembrolizumab`, and `Pembrolizumab 200 mg
-injection` all collapse to one node. When the API supplies a MeSH term
-that matches the canonical form, that term wins as the display label.
+`5 mg/kg`), dosage forms (`injection`, `tablet`, `oral`), and salt /
+ester / hydrate suffixes (`mesylate`, `phosphate`, `s-malate`,
+`hydrochloride`, `monohydrate`, …) stripped. So `Pembrolizumab`,
+`pembrolizumab`, and `Pembrolizumab 200 mg injection` all collapse to
+one node, and `Dabrafenib` / `Dabrafenib Mesylate` /
+`Cabozantinib S-malate` / `Fludarabine phosphate monohydrate` resolve to
+their parent INNs. A blocklist also drops MeSH umbrella terms (e.g.
+*Antineoplastic Agents*, *Cancer Vaccines*, *Immunoglobulin G*,
+*CTLA-4 Antigen*, *Introns*) and procedure-like artifacts (e.g. *Blood
+Specimen Collection*, *Gene Expression Profiling*, *Immunohistochemistry*)
+so they never appear as drug nodes. When the API supplies a MeSH term
+that matches a kept canonical form, that term wins as the display label.
+The graph builder also supports site↔drug networks using CT.gov
+location facility/city/country fields; site nodes use `type: "site"`.
+
+Network output also honors the request-level `top_n`: when set, edges
+are clipped to the top-N highest-weight pairs and any nodes whose only
+edges were clipped are dropped from the response. `meta.edges_returned` /
+`meta.nodes_returned` are updated accordingly.
 
 ---
 
@@ -310,18 +427,36 @@ that matches the canonical form, that term wins as the display label.
 - **Transport fallback.** Some CDN edges have been observed returning
   `403` to httpx but not to stdlib `urllib`. On `403`, the client
   automatically retries the same request via `urllib.request` in a
-  thread, so the service stays usable.
+  thread — *and* sets a process-wide flag so subsequent requests skip
+  the httpx attempt entirely. This avoids paying the 403 RTT on every
+  fan-out cell when the local CDN edge is unfriendly to httpx; the flag
+  resets on process restart.
 - **Planner repair.** If OpenAI fails or returns malformed output, the
   request retries once; if it still fails, the planner falls back to a
   safe default plan (year trend if a year filter is set, else phase
   distribution) and surfaces the reason in `meta.warnings`. The
   endpoint never `500`s on planning failures.
+- **Answerability guard.** Plainly off-topic requests with no structured
+  trial filters (for example weather or stock-price questions) are routed
+  to the same safe-default response and warning path instead of presenting
+  an inferred plan as confident.
 
 ## Tuning knobs (env vars)
 
 - `CTGOV_PAGINATE_CAP` (default `2000`) — generic-path pagination cap;
-  raise for more exact counts on high-cardinality dims at the cost of
+  raise for more exact counts on generic sampled paths at the cost of
   latency.
+- `CTGOV_HIGH_CARD_SCAN_CAP` (default `10000`) — candidate-discovery scan
+  window for high-cardinality bar charts (`lead_sponsor`, `condition`,
+  `intervention_name`) before per-candidate exact `countTotal` fan-out.
+- `CTGOV_NUMERIC_SCAN_CAP` (default `10000`) — applies to `histogram`
+  and `scatter_plot` so numeric distributions cover a broad sample of
+  matched trials.
+- `CTGOV_SCATTER_POINT_CAP` (default `1000`) — display cap applied to
+  scatter response points after the numeric scan; set to `0` to disable.
+- `CTGOV_NETWORK_SCAN_CAP` (default `5000`) — applies to `network_graph`
+  scans so edge weights reflect more relationships before the 200-edge
+  display cap kicks in.
 - `CTGOV_CACHE_TTL` (default `300` seconds), `CTGOV_CACHE_MAX` (default
   `256`) — in-process TTL cache for repeat queries.
 - `CTGOV_CONCURRENCY` (default `8`) — semaphore on in-flight CT.gov
@@ -330,14 +465,25 @@ that matches the canonical form, that term wins as the display label.
 
 ## Limitations and future work
 
-- **Exact counts only for `phase` / `overall_status` / `year`.** Could
-  be extended to `study_type`, `sex`, and `sponsor_class` with the same
-  fan-out pattern; left as future work to keep latency predictable.
-- **High-cardinality accuracy is bounded.** For country / sponsor /
-  condition distributions, exact counts hold up to `CTGOV_PAGINATE_CAP`
-  matched trials; above that the result is honestly labeled
-  `truncated: true` with `sampled: true` per datum and no biased
-  extrapolation.
+- **Exact counts via fan-out for six small-enum dims** (`phase`,
+  `overall_status`, `sponsor_class`, `study_type`, `sex`,
+  `intervention_type`) plus `year` time-series and X-vs-Y comparisons
+  over those dims. Each dim's bucket list is enumerated up front; one
+  tiny `countTotal=true` request per bucket in parallel. Empty years and
+  empty exact comparison cells are returned as explicit zero-count rows.
+- **Country rankings use fixed-list exact fan-out.** We enumerate common
+  CT.gov country names and run one `countTotal=true` query per country,
+  so the shown top-N reflects exact counts for that list rather than the
+  first page of studies. A country outside the fixed list will not appear
+  unless it was supplied as the request-level `country` filter.
+- **Sponsor / condition / intervention-name top-N rankings use
+  candidate-discovery exact fan-out.** A sample window of up to
+  `CTGOV_HIGH_CARD_SCAN_CAP` trials seeds the candidate set, then each
+  discovered candidate gets its own `countTotal=true` request — so the
+  *shown* trial counts are exact. The trade-off is that values that
+  appear only outside the sample window (rare combinations) won't make
+  the candidate list. A `candidate_set_sampled` warning is emitted in
+  that case.
 - **Free-text drug/condition matching.** We pass user-provided
   drug/condition strings (after a small alias normalization step,
   `app/aliases.py`) straight through to `query.intr` / `query.cond`. A
@@ -357,9 +503,17 @@ that matches the canonical form, that term wins as the display label.
 ```
 app/
   __init__.py
-  main.py             FastAPI app + routes
+  main.py             FastAPI setup + routes
+  paths.py            /analyze path selection and execution strategies
+  exact_counts.py     countTotal fan-out helpers
+  responses.py        response post-processing + AnalyzeResponse assembly
+  constants.py        shared enum values, labels, country buckets
+  drugs.py            drug canonicalization + network drug extraction
   schemas.py          Pydantic request/response/plan models
-  planner.py          OpenAI structured-output planner + stub mode
+  planner.py          OpenAI planner orchestration + stub mode composition
+  planner_schema.py   planner prompt + strict OpenAI JSON schema
+  nl_extract.py       deterministic NL extraction/routing helpers
+  plan_verifier.py    planner intent repair + off-topic guard
   ctgov.py            ClinicalTrials.gov v2 client + study normalizer
   aggregate.py        build_bar / build_grouped_bar / build_time_series / build_histogram / build_scatter / build_network
   citations.py        excerpt selection + cite() helper
@@ -367,7 +521,7 @@ app/
     index.html        single-page demo UI
     app.js            Vega-Lite + vis-network rendering
     style.css
-examples/             5 captured request/response JSON pairs
+examples/             7 captured request/response JSON pairs
 tests/
   test_aggregate.py   unit tests for every builder
   test_planner.py     stub-mode classification tests

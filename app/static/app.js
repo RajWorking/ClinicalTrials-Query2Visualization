@@ -74,6 +74,7 @@ function renderNetwork(v) {
     sponsor: "#2563eb",
     drug: "#10b981",
     condition: "#f59e0b",
+    site: "#8b5cf6",
   };
   const nodes = new vis.DataSet(
     v.nodes.map((n) => ({

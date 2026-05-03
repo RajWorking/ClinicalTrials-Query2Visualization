@@ -33,6 +33,8 @@ def test_normalize_pulls_expected_fields_from_real_payload():
     assert flat["overall_status"]
     assert flat["start_date"]
     assert "United States" in (flat["countries"] or [])
+    assert flat["locations"]
+    assert "country" in flat["locations"][0]
     # interventions retain (name, type) pairs
     assert flat["interventions"]
     assert all("name" in i for i in flat["interventions"])
@@ -57,6 +59,22 @@ def test_filters_to_params_phase_advanced_filter():
 def test_filters_to_params_year_range():
     p = filters_to_params(Filters(start_year=2020, end_year=2023))
     assert "RANGE[2020-01-01,2023-12-31]" in p["filter.advanced"]
+
+
+def test_filters_to_params_small_enum_filters():
+    p = filters_to_params(
+        Filters(
+            sponsor_class="industry",
+            study_type="observational",
+            sex="women",
+            intervention_type="biologic",
+        )
+    )
+    advanced = p["filter.advanced"]
+    assert "AREA[LeadSponsorClass]INDUSTRY" in advanced
+    assert "AREA[StudyType]OBSERVATIONAL" in advanced
+    assert "AREA[Sex]FEMALE" in advanced
+    assert "AREA[InterventionType]BIOLOGICAL" in advanced
 
 
 @pytest.mark.asyncio

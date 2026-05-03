@@ -4,6 +4,15 @@ from __future__ import annotations
 import re
 from typing import Callable, Iterable, Optional
 
+from .constants import (
+    INTERVENTION_TYPE_LABELS,
+    PHASE_LABELS,
+    PHASE_VARIANTS,
+    SEX_LABELS,
+    SPONSOR_CLASS_LABELS,
+    STATUS_LABELS,
+    STUDY_TYPE_LABELS,
+)
 from .schemas import Citation
 
 
@@ -19,21 +28,13 @@ _FIELD_PATHS: dict[str, str] = {
     "lead_sponsor": "protocolSection.sponsorCollaboratorsModule.leadSponsor.name",
     "sponsor_class": "protocolSection.sponsorCollaboratorsModule.leadSponsor.class",
     "condition": "protocolSection.conditionsModule.conditions",
+    "site": "protocolSection.contactsLocationsModule.locations[]",
     "intervention_type": "protocolSection.armsInterventionsModule.interventions[].type",
     "intervention_name": "protocolSection.armsInterventionsModule.interventions[].name",
     "year": "protocolSection.statusModule.startDateStruct.date",
     "quarter": "protocolSection.statusModule.startDateStruct.date",
     "month": "protocolSection.statusModule.startDateStruct.date",
 }
-
-_PHASE_VARIANTS = {
-    "PHASE1": ("Phase 1", "Phase I"),
-    "PHASE2": ("Phase 2", "Phase II"),
-    "PHASE3": ("Phase 3", "Phase III"),
-    "PHASE4": ("Phase 4", "Phase IV"),
-    "EARLY_PHASE1": ("Early Phase 1", "Early Phase I"),
-}
-
 
 def _truncate(text: str, n: int = MAX_EXCERPT) -> str:
     text = " ".join((text or "").split())
@@ -50,7 +51,7 @@ def _aliases_for(dim: str, value: str) -> list[str]:
         canon = value.replace(" ", "").upper()
         if not canon.startswith("PHASE"):
             canon = "PHASE" + canon
-        return [value, *_PHASE_VARIANTS.get(canon, ())]
+        return [value, *PHASE_VARIANTS.get(canon, ())]
     if dim in ("year", "quarter", "month"):
         return [value[:4]]
     if dim in ("overall_status", "country", "condition", "intervention_name"):
@@ -79,21 +80,71 @@ def _list_with_more(items: list[str], label: str, n: int = 5) -> str:
     return f"{label}: {shown}{more}"
 
 
+def _label(value: Optional[str], labels: dict[str, str]) -> Optional[str]:
+    if value is None:
+        return None
+    return labels.get(value, value)
+
+
+def _labels(values: list[str], labels: dict[str, str]) -> list[str]:
+    return [labels.get(value, value) for value in values if value]
+
+
 _STRUCTURED_FORMATTERS: dict[str, Callable[[dict], Optional[str]]] = {
-    "phase": lambda s: f"phases: {s['phases']}" if s.get("phases") else None,
-    "overall_status": lambda s: f"overallStatus: {s['overall_status']}" if s.get("overall_status") else None,
-    "study_type": lambda s: f"studyType: {s['study_type']}" if s.get("study_type") else None,
-    "sex": lambda s: f"sex: {s['sex']}" if s.get("sex") else None,
+    "phase": lambda s: _list_with_more(_labels(s["phases"], PHASE_LABELS), "phases") if s.get("phases") else None,
+    "overall_status": lambda s: f"overallStatus: {_label(s['overall_status'], STATUS_LABELS)}" if s.get("overall_status") else None,
+    "study_type": lambda s: f"studyType: {_label(s['study_type'], STUDY_TYPE_LABELS)}" if s.get("study_type") else None,
+    "sex": lambda s: f"sex: {_label(s['sex'], SEX_LABELS)}" if s.get("sex") else None,
     "lead_sponsor": lambda s: f"leadSponsor: {s['lead_sponsor']}" if s.get("lead_sponsor") else None,
-    "sponsor_class": lambda s: f"leadSponsorClass: {s['sponsor_class']}" if s.get("sponsor_class") else None,
+    "sponsor_class": lambda s: f"leadSponsorClass: {_label(s['sponsor_class'], SPONSOR_CLASS_LABELS)}" if s.get("sponsor_class") else None,
     "country": lambda s: _list_with_more(s["countries"], "locations") if s.get("countries") else None,
     "condition": lambda s: _list_with_more(s["conditions"], "conditions") if s.get("conditions") else None,
-    "intervention_type": lambda s: f"interventionTypes: {s['intervention_types']}" if s.get("intervention_types") else None,
-    "intervention_name": lambda s: f"interventions: {s['intervention_names'][:5]}" if s.get("intervention_names") else None,
+    "site": lambda s: _list_with_more(_site_labels(s), "sites") if _site_labels(s) else None,
+    "intervention_type": lambda s: _list_with_more(_labels(s["intervention_types"], INTERVENTION_TYPE_LABELS), "interventionTypes") if s.get("intervention_types") else None,
+    "intervention_name": lambda s: _list_with_more(s["intervention_names"], "interventions") if s.get("intervention_names") else None,
     "year": lambda s: f"startDate: {s['start_date']}" if s.get("start_date") else None,
     "quarter": lambda s: f"startDate: {s['start_date']}" if s.get("start_date") else None,
     "month": lambda s: f"startDate: {s['start_date']}" if s.get("start_date") else None,
 }
+
+
+def _site_labels(study: dict) -> list[str]:
+    labels = []
+    for loc in study.get("locations") or []:
+        facility = (loc.get("facility") or "").strip()
+        country = (loc.get("country") or "").strip()
+        city = (loc.get("city") or "").strip()
+        label = facility or city or country
+        if label and country and country not in label:
+            label = f"{label} ({country})"
+        if label:
+            labels.append(label)
+    if not labels:
+        labels = list(study.get("countries") or [])
+    return labels
+
+
+def _network_field_text(study: dict, node_type: str) -> Optional[tuple[str, str]]:
+    if node_type == "sponsor" and study.get("lead_sponsor"):
+        return (
+            f"leadSponsor: {study['lead_sponsor']}",
+            _FIELD_PATHS["lead_sponsor"],
+        )
+    if node_type == "drug" and study.get("intervention_names"):
+        return (
+            _list_with_more(study["intervention_names"], "interventions"),
+            _FIELD_PATHS["intervention_name"],
+        )
+    if node_type == "condition" and study.get("conditions"):
+        return (
+            _list_with_more(study["conditions"], "conditions"),
+            _FIELD_PATHS["condition"],
+        )
+    if node_type == "site":
+        labels = _site_labels(study)
+        if labels:
+            return (_list_with_more(labels, "sites"), _FIELD_PATHS["site"])
+    return None
 
 
 def _one_citation(study: dict, dim: Optional[str], value: Optional[str]) -> Citation:
@@ -149,3 +200,40 @@ def cite_for(
 def cite(studies: Iterable[dict], n: int = DEFAULT_PER_BUCKET) -> list[Citation]:
     """Generic citations — for scatter and network where there's no single dim."""
     return cite_for(studies, None, None, n=n)
+
+
+def cite_network_edge(
+    studies: Iterable[dict],
+    source_type: str,
+    target_type: str,
+    n: int = DEFAULT_PER_BUCKET,
+) -> list[Citation]:
+    """Structured citations for relationship edges.
+
+    The excerpt names the source-side and target-side CT.gov fields that form
+    the edge, so network relationships are traceable rather than title-only.
+    """
+    out: list[Citation] = []
+    for s in studies:
+        if not s.get("nct_id"):
+            continue
+        parts: list[str] = []
+        paths: list[str] = []
+        for node_type in dict.fromkeys((source_type, target_type)):
+            formatted = _network_field_text(s, node_type)
+            if formatted:
+                text, path = formatted
+                parts.append(text)
+                paths.append(path)
+        if parts:
+            out.append(Citation(
+                nct_id=s["nct_id"],
+                excerpt=_truncate("; ".join(parts)),
+                source_field=" + ".join(dict.fromkeys(paths)),
+                url=study_url(s["nct_id"]),
+            ))
+        else:
+            out.append(_one_citation(s, None, None))
+        if len(out) >= n:
+            break
+    return out

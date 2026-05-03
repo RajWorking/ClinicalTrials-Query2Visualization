@@ -34,16 +34,6 @@ def test_distribution_query_picks_bar():
     assert plan.aggregation.group_by == "phase"
 
 
-def test_compare_query_picks_grouped_bar():
-    plan = plan_query(
-        AnalyzeRequest(query="Compare Pembrolizumab vs Nivolumab by phase.")
-    )
-    assert plan.visualization_type == "grouped_bar_chart"
-    assert plan.aggregation.series == "intervention_name"
-    assert plan.aggregation.series_values
-    assert len(plan.aggregation.series_values) == 2
-
-
 def test_country_query_picks_bar_country():
     plan = plan_query(
         AnalyzeRequest(
@@ -62,7 +52,17 @@ def test_network_query_picks_network():
                        condition="Melanoma")
     )
     assert plan.visualization_type == "network_graph"
-    assert plan.aggregation.network_kind in {"sponsor_drug", "drug_condition", "drug_drug"}
+    assert plan.aggregation.network_kind in {
+        "sponsor_drug", "drug_condition", "drug_drug", "site_drug",
+    }
+
+
+def test_site_drug_query_picks_site_network():
+    plan = plan_query(
+        AnalyzeRequest(query="Show trial sites and drugs for melanoma.")
+    )
+    assert plan.visualization_type == "network_graph"
+    assert plan.aggregation.network_kind == "site_drug"
 
 
 def test_user_overrides_win():
@@ -86,6 +86,16 @@ def test_stub_extracts_condition_head_from_query():
     )
     assert plan.filters.status == "RECRUITING"
     assert "cancer" in (plan.filters.condition or "").lower()
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("Which countries have the most recruiting breast cancer trials?", "Breast Cancer"),
+    ("completed trials by country for lung cancer", "Lung Cancer"),
+    ("trials by phase for non-small cell lung cancer", "Non-Small Cell Lung Cancer"),
+])
+def test_stub_extracts_common_multiword_conditions(query, expected):
+    plan = plan_query(AnalyzeRequest(query=query))
+    assert plan.filters.condition == expected
 
 
 def test_stub_extracts_condition_alias_from_query():
@@ -112,6 +122,31 @@ def test_stub_extracts_year_range_between():
     assert plan.filters.end_year == 2022
 
 
+def test_stub_extracts_phase_filter_from_query():
+    plan = plan_query(
+        AnalyzeRequest(query="How many Phase 3 recruiting trials by country?")
+    )
+    assert plan.aggregation.group_by == "country"
+    assert plan.filters.phase == "PHASE3"
+    assert plan.filters.status == "RECRUITING"
+
+
+def test_stub_extracts_small_enum_filters_from_query():
+    plan = plan_query(
+        AnalyzeRequest(
+            query=(
+                "Does enrollment correlate with trial duration for "
+                "industry-sponsored observational female-only biologic trials?"
+            )
+        )
+    )
+    assert plan.visualization_type == "scatter_plot"
+    assert plan.filters.sponsor_class == "INDUSTRY"
+    assert plan.filters.study_type == "OBSERVATIONAL"
+    assert plan.filters.sex == "FEMALE"
+    assert plan.filters.intervention_type == "BIOLOGICAL"
+
+
 def test_chart_intent_wins_over_filter_keyword():
     """`recruiting breast cancer trials by phase` → bar by phase, not status."""
     plan = plan_query(
@@ -134,13 +169,48 @@ def test_completed_trials_by_country():
     assert "diabetes" in (plan.filters.condition or "").lower()
 
 
-def test_compare_with_by_phase_still_grouped():
-    """`compare X vs Y by phase` is grouped_bar, not by-phase bar chart."""
-    plan = plan_query(
-        AnalyzeRequest(query="Compare Pembrolizumab vs Nivolumab by phase")
-    )
+@pytest.mark.parametrize("axis_phrase,expected_dim", [
+    ("phase", "phase"),
+    ("year", "year"),
+    ("status", "overall_status"),
+    ("country", "country"),
+    ("sponsor class", "sponsor_class"),
+])
+def test_compare_axis_routes_grouped_bar(axis_phrase, expected_dim):
+    """`compare X vs Y by <axis>` → grouped_bar with the requested axis."""
+    plan = plan_query(AnalyzeRequest(
+        query=f"Compare Pembrolizumab vs Nivolumab by {axis_phrase}",
+    ))
     assert plan.visualization_type == "grouped_bar_chart"
-    assert plan.aggregation.group_by == "phase"
+    assert plan.aggregation.group_by == expected_dim
+    assert plan.aggregation.series == "intervention_name"
+    assert plan.aggregation.series_values == ["Pembrolizumab", "Nivolumab"]
+
+
+def test_validate_plan_repairs_axis_when_llm_disagrees(monkeypatch):
+    """A plan with the wrong axis must be repaired when the query is
+    unambiguous, and the correction must be surfaced in
+    query_interpretation so the response is auditable."""
+    from app.planner import _validate_plan_intent
+    from app.schemas import Aggregation, Filters, QueryPlan
+
+    plan = QueryPlan(
+        visualization_type="grouped_bar_chart",
+        title="Phase distribution: Pembrolizumab vs Nivolumab",
+        query_interpretation="Compare phase distribution.",
+        filters=Filters(),
+        aggregation=Aggregation(
+            group_by="phase",
+            series="intervention_name",
+            series_values=["Pembrolizumab", "Nivolumab"],
+        ),
+    )
+    repaired = _validate_plan_intent(
+        plan,
+        AnalyzeRequest(query="Compare Pembrolizumab vs Nivolumab by year"),
+    )
+    assert repaired.aggregation.group_by == "year"
+    assert "axis repaired" in repaired.query_interpretation.lower()
 
 
 def test_no_chart_intent_falls_back_to_status_distribution():
@@ -153,19 +223,12 @@ def test_no_chart_intent_falls_back_to_status_distribution():
     assert plan.filters.status == "RECRUITING"
 
 
-def test_drug_drug_cooccurrence_picks_network():
-    plan = plan_query(
-        AnalyzeRequest(query="Which drugs co-occur in combination studies?")
-    )
-    assert plan.visualization_type == "network_graph"
-    assert plan.aggregation.network_kind == "drug_drug"
-
-
-def test_combination_trials_picks_drug_drug_network():
-    plan = plan_query(
-        AnalyzeRequest(query="What drugs are used together in oncology trials?")
-    )
-    # "together" is a co-occurrence signal; condition extracted to filter.
+@pytest.mark.parametrize("query", [
+    "Which drugs co-occur in combination studies?",
+    "What drugs are used together in oncology trials?",
+])
+def test_drug_drug_cooccurrence_signals_pick_network(query):
+    plan = plan_query(AnalyzeRequest(query=query))
     assert plan.visualization_type == "network_graph"
     assert plan.aggregation.network_kind == "drug_drug"
 
@@ -187,7 +250,4 @@ def test_compare_phases_across_sponsors():
     # group_by = sponsor (the axis after "across")
     assert plan.aggregation.group_by == "lead_sponsor"
     # series = phase (the dim being compared)
-    assert plan.aggregation.series in ("phase", None)
-    # phase isn't in DIM_CATEGORY_KEYWORDS yet, so this routes to X-vs-Y
-    # fallback; assert the fallback sane-default rather than fail. The
-    # important thing is that grouped_bar_chart was chosen.
+    assert plan.aggregation.series == "phase"

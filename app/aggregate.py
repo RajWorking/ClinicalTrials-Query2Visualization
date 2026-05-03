@@ -1,84 +1,18 @@
 """Deterministic aggregation of normalized studies into visualization data."""
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from typing import Any, Optional
 
-from .citations import cite, cite_for
+from .citations import cite, cite_for, cite_network_edge
+from .constants import PHASE_LABELS, STATUS_LABELS
+from .drugs import (
+    DRUG_NAME_BLOCKLIST, canonicalize_drug, drug_names as _drug_names,
+)
 from .schemas import Aggregation, QueryPlan
 
 
-# ---- network-graph entity filters -----------------------------------------
-
-DRUG_LIKE_TYPES = {"DRUG", "BIOLOGICAL", "COMBINATION_PRODUCT"}
-
-# Names (canonicalized) that don't identify a specific molecule.
-DRUG_NAME_BLOCKLIST = {
-    # placebo / control / vehicle
-    "placebo", "saline", "vehicle", "normal saline", "matching placebo",
-    "placebo control", "placebo comparator", "control", "control arm",
-    "no intervention", "sham", "sham comparator", "untreated", "active comparator",
-    # supportive / SOC
-    "best supportive care", "supportive care", "standard of care", "soc",
-    "standard therapy", "standard treatment", "usual care",
-    # biospecimens / procedures often miscoded as DRUG
-    "blood sample", "blood draw", "biopsy", "questionnaire", "survey",
-    "observation", "exercise", "education", "counseling",
-    # broad classes
-    "chemotherapy", "chemo", "radiotherapy", "radiation",
-    "immunotherapy", "targeted therapy", "combination chemotherapy",
-    "investigator's choice", "physician's choice", "patient's choice",
-    # arm-label artifacts
-    "arm a", "arm b", "arm c", "arm 1", "arm 2", "arm 3",
-    "cohort a", "cohort b", "cohort 1", "cohort 2",
-    "experimental arm", "experimental",
-}
-
-_ARM_LABEL_PATTERN = re.compile(
-    r"^(?:arm|cohort|group|stage|part|step)\s*[a-z0-9\-]+$", re.IGNORECASE,
-)
-
-_DOSAGE_FORMS = (
-    r"injection|infusion|tablet|tablets|capsule|capsules|solution|"
-    r"suspension|cream|ointment|gel|patch|spray|drops|inhaler|"
-    r"oral|iv|i\.v\.|subcutaneous|sc|sublingual"
-)
-_DOSE_PATTERN = re.compile(
-    r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|kg|iu|units|%|mg/m2|mg/kg)\b", re.IGNORECASE,
-)
-_FORM_PATTERN = re.compile(rf"\b(?:{_DOSAGE_FORMS})\b", re.IGNORECASE)
-_PAREN_PATTERN = re.compile(r"\([^)]*\)")
-_BRACKET_PATTERN = re.compile(r"\[[^\]]*\]")
-_WHITESPACE = re.compile(r"\s+")
-
-
-def canonicalize_drug(name: str) -> str:
-    """Lowercase + strip parentheticals, dosage values, dosage forms."""
-    s = name.strip()
-    s = _PAREN_PATTERN.sub(" ", s)
-    s = _BRACKET_PATTERN.sub(" ", s)
-    s = _DOSE_PATTERN.sub(" ", s)
-    s = _FORM_PATTERN.sub(" ", s)
-    s = re.sub(r"[,;]+", " ", s)
-    return _WHITESPACE.sub(" ", s).strip().lower()
-
-
 # ---- field accessors ------------------------------------------------------
-
-PHASE_LABEL = {
-    "PHASE1": "Phase 1", "PHASE2": "Phase 2", "PHASE3": "Phase 3",
-    "PHASE4": "Phase 4", "EARLY_PHASE1": "Early Phase 1", "NA": "Not Applicable",
-}
-STATUS_LABEL = {
-    "RECRUITING": "Recruiting", "NOT_YET_RECRUITING": "Not yet recruiting",
-    "ACTIVE_NOT_RECRUITING": "Active, not recruiting", "COMPLETED": "Completed",
-    "TERMINATED": "Terminated", "WITHDRAWN": "Withdrawn", "SUSPENDED": "Suspended",
-    "ENROLLING_BY_INVITATION": "Enrolling by invitation", "UNKNOWN": "Unknown",
-    "AVAILABLE": "Available", "NO_LONGER_AVAILABLE": "No longer available",
-    "TEMPORARILY_NOT_AVAILABLE": "Temporarily not available",
-    "APPROVED_FOR_MARKETING": "Approved for marketing", "WITHHELD": "Withheld",
-}
 
 
 def _parse_year(date_str: Optional[str]) -> Optional[int]:
@@ -111,10 +45,10 @@ def _values_for_dim(study: dict, dim: str) -> list[str]:
     """One or more bucket-values for a study under a given dimension."""
     if dim == "phase":
         phases = study.get("phases") or []
-        return [PHASE_LABEL.get(p, p) for p in phases] or ["Not Applicable"]
+        return [PHASE_LABELS.get(p, p) for p in phases] or ["Not Applicable"]
     if dim == "overall_status":
         s = study.get("overall_status")
-        return [STATUS_LABEL.get(s, s)] if s else []
+        return [STATUS_LABELS.get(s, s)] if s else []
     if dim in ("study_type", "sex", "sponsor_class"):
         s = study.get(dim)
         return [s.title()] if s else []
@@ -189,6 +123,34 @@ def build_grouped_bar(
         for key, slist in _bucket_studies(studies, group_dim).items():
             rows.append(_datum(slist, group_dim, key, **{series_dim: series_value}))
     rows.sort(key=lambda r: (r[group_dim], r[series_dim]))
+    return _grouped_bar_envelope(rows, group_dim, series_dim)
+
+
+def build_grouped_bar_cross(studies: list[dict], plan: QueryPlan) -> dict[str, Any]:
+    """Cross-bucket a single study list by (group_dim, series_dim).
+
+    Used when `series` is a dimension (e.g. sponsor_class) and the planner
+    didn't supply explicit series_values. A study counts in every cell
+    (group_value × series_value) reachable from its multi-valued fields.
+    """
+    group_dim = plan.aggregation.group_by or "phase"
+    series_dim = plan.aggregation.series or "sponsor_class"
+    cells: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for s in studies:
+        for g in _values_for_dim(s, group_dim):
+            for sv in _values_for_dim(s, series_dim):
+                cells[(g, sv)].append(s)
+    rows = [
+        _datum(slist, group_dim, g, **{series_dim: sv})
+        for (g, sv), slist in cells.items()
+    ]
+    rows.sort(key=lambda r: (r[group_dim], r[series_dim]))
+    return _grouped_bar_envelope(rows, group_dim, series_dim)
+
+
+def _grouped_bar_envelope(
+    rows: list[dict[str, Any]], group_dim: str, series_dim: str,
+) -> dict[str, Any]:
     return {
         "data": rows,
         "encoding": {
@@ -262,9 +224,16 @@ def build_scatter(studies: list[dict], plan: QueryPlan) -> dict[str, Any]:
         xv, yv = _numeric_values([s], xf), _numeric_values([s], yf)
         if not xv or not yv:
             continue
+        nct = s.get("nct_id")
         points.append({
             xf: xv[0][0], yf: yv[0][0],
-            "nct_id": s.get("nct_id"),
+            "nct_id": nct,
+            # Uniform citation/support fields across viz types — every scatter
+            # point is supported by exactly its own trial.
+            "trial_count": 1,
+            "supporting_nct_ids": [nct] if nct else [],
+            "supporting_nct_ids_complete": True,
+            "citation_count": 1 if nct else 0,
             "citations": [c.model_dump() for c in cite([s], n=1)],
         })
     return {
@@ -278,43 +247,32 @@ def build_scatter(studies: list[dict], plan: QueryPlan) -> dict[str, Any]:
 
 # ---- network builder ------------------------------------------------------
 
-def _drug_names(study: dict) -> list[tuple[str, str]]:
-    """Drug-like interventions as (canonical_id, display_label), deduped per study.
-
-    Filters non-drug intervention types, arm-label artifacts, and blocklisted
-    names. When a MeSH term shares a canonical form with an intervention, the
-    MeSH form wins as the display label.
-    """
-    mesh_terms = [
-        (t or "").strip()
-        for t in (study.get("intervention_mesh") or [])
-        if (t or "").strip()
-    ]
-    mesh_by_canon = {canonicalize_drug(t): t for t in mesh_terms}
-
+def _site_nodes(study: dict) -> list[tuple[str, str]]:
+    """Site nodes as (stable_id, display_label), deduped per study."""
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for i in study.get("interventions") or []:
-        name = (i.get("name") or "").strip()
-        if not name:
+    for loc in study.get("locations") or []:
+        facility = (loc.get("facility") or "").strip()
+        city = (loc.get("city") or "").strip()
+        state = (loc.get("state") or "").strip()
+        country = (loc.get("country") or "").strip()
+        label_base = facility or city or country
+        if not label_base:
             continue
-        itype = (i.get("type") or "").upper()
-        if itype and itype not in DRUG_LIKE_TYPES:
-            continue
-        if _ARM_LABEL_PATTERN.match(name):
-            continue
-        canon = canonicalize_drug(name)
-        if not canon or canon in DRUG_NAME_BLOCKLIST or canon in seen:
-            continue
-        seen.add(canon)
-        out.append((canon, mesh_by_canon.get(canon, name)))
-
-    # MeSH terms unrelated to listed interventions: still useful (clinically canonical).
-    for mesh in mesh_terms:
-        canon = canonicalize_drug(mesh)
-        if canon and canon not in seen and canon not in DRUG_NAME_BLOCKLIST:
-            seen.add(canon)
-            out.append((canon, mesh))
+        region = ", ".join(p for p in (city if facility else "", state, country) if p)
+        label = f"{label_base} ({region})" if region and region not in label_base else label_base
+        node_id = "site:" + "|".join(
+            p.lower() for p in (facility or city or country, city, state, country) if p
+        )
+        if node_id not in seen:
+            seen.add(node_id)
+            out.append((node_id, label))
+    if not out:
+        for country in study.get("countries") or []:
+            node_id = f"site:{country.lower()}"
+            if node_id not in seen:
+                seen.add(node_id)
+                out.append((node_id, country))
     return out
 
 
@@ -356,6 +314,15 @@ def build_network(studies: list[dict], plan: QueryPlan) -> dict[str, Any]:
             for i in range(len(drugs)):
                 for j in range(i + 1, len(drugs)):
                     edges[(drugs[i][0], drugs[j][0])].append(s)
+        elif kind == "site_drug":
+            sites = _site_nodes(s)
+            drugs = _drug_names(s) if sites else []
+            for site_id, label in sites:
+                add_node(site_id, "site", label)
+            for canon, display in drugs:
+                add_node(canon, "drug", display)
+                for site_id, _label in sites:
+                    edges[(site_id, canon)].append(s)
 
     # Adaptive prune: drop weight-1 edges in dense graphs, then cap at 200.
     EDGE_CAP = 200
@@ -379,7 +346,17 @@ def build_network(studies: list[dict], plan: QueryPlan) -> dict[str, Any]:
     edge_list = [
         {
             "source": a, "target": b, "weight": len(slist),
-            "citations": [c.model_dump() for c in cite(slist)],
+            "trial_count": len(slist),
+            # Edges are exact within the scanned study set; the upstream
+            # path layers on `sampled=true` if that study set was truncated.
+            "sampled": False,
+            "supporting_nct_ids": [s["nct_id"] for s in slist if s.get("nct_id")],
+            "supporting_nct_ids_complete": True,
+            "citation_count": sum(1 for s in slist if s.get("nct_id")),
+            "citations": [
+                c.model_dump()
+                for c in cite_network_edge(slist, nodes.get(a, ""), nodes.get(b, ""))
+            ],
         }
         for (a, b), slist in edge_items
     ]

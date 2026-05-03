@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,25 +9,11 @@ from fastapi.testclient import TestClient
 os.environ["STUB_LLM"] = "1"  # tests don't need an OpenAI key
 
 from app import main as main_module  # noqa: E402
-from app.schemas import Filters  # noqa: E402
 
-
-def _study(nct: str, **over: Any) -> dict:
-    base = {
-        "nct_id": nct, "brief_title": f"Study {nct}", "brief_summary": "Summary",
-        "phases": ["PHASE2"], "study_type": "INTERVENTIONAL", "sex": "ALL",
-        "overall_status": "RECRUITING",
-        "start_date": "2020-05-01", "completion_date": "2022-05-01",
-        "enrollment_count": 100, "lead_sponsor": "Acme",
-        "sponsor_class": "INDUSTRY", "conditions": ["Cancer"],
-        "interventions": [{"name": "DrugA", "type": "DRUG"}],
-        "intervention_names": ["DrugA"], "intervention_types": ["DRUG"],
-        "countries": ["United States"],
-    }
-    base.update(over)
-    if "interventions" in over and "intervention_names" not in over:
-        base["intervention_names"] = [i["name"] for i in base["interventions"]]
-    return base
+from ._helpers import (  # noqa: E402
+    FakeCTGovClient, make_fake_client_class, make_fixed_corpus_client,
+    make_study as _study,
+)
 
 
 CORPUS = [
@@ -52,54 +37,7 @@ CORPUS = [
 ]
 
 
-class FakeClient:
-    def __init__(self, *_a, **_k):
-        pass
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_):
-        return False
-
-    async def search_studies(
-        self, filters: Filters, max_studies: int = 500, **_k
-    ) -> tuple[list[dict], int]:
-        sel = list(CORPUS)
-        if filters.drug_name:
-            d = filters.drug_name.lower()
-            sel = [s for s in sel if any(d in n.lower() for n in s["intervention_names"])]
-        if filters.condition:
-            c = filters.condition.lower()
-            sel = [s for s in sel if any(c in cd.lower() for cd in s["conditions"])]
-        if filters.phase:
-            sel = [s for s in sel if filters.phase in s["phases"]]
-        if filters.status:
-            sel = [s for s in sel if s["overall_status"] == filters.status]
-        if filters.country:
-            cn = filters.country.lower()
-            sel = [s for s in sel if any(cn in c.lower() for c in s["countries"])]
-        if filters.start_year:
-            sel = [
-                s for s in sel
-                if s.get("start_date") and int(s["start_date"][:4]) >= filters.start_year
-            ]
-        if filters.end_year:
-            sel = [
-                s for s in sel
-                if s.get("start_date") and int(s["start_date"][:4]) <= filters.end_year
-            ]
-        return sel[:max_studies], len(sel)
-
-    async def count_for_filters(self, filters: Filters) -> int:
-        sel, total = await self.search_studies(filters, max_studies=1)
-        return total
-
-    async def ids_for_filters(
-        self, filters: Filters, max_ids: int = 5000, page_size: int = 1000
-    ) -> tuple[set[str], int, bool]:
-        sel, total = await self.search_studies(filters, max_studies=max_ids)
-        return {s["nct_id"] for s in sel}, total, total > len(sel)
+FakeClient = make_fake_client_class(CORPUS)
 
 
 @pytest.fixture
@@ -149,6 +87,23 @@ def test_time_series_path(client):
     assert all(d["sampled"] is False for d in body["visualization"]["data"])
 
 
+def test_time_series_zero_fills_missing_years(client):
+    r = client.post(
+        "/analyze",
+        json={
+            "query": "How has the number of trials changed each year?",
+            "start_year": 2017,
+            "end_year": 2021,
+        },
+    )
+    body = r.json()
+    years = {d["year"]: d for d in body["visualization"]["data"]}
+    assert list(years) == ["2017", "2018", "2019", "2020", "2021"]
+    assert years["2017"]["trial_count"] == 0
+    assert years["2017"]["citations"] == []
+    assert years["2017"]["supporting_nct_ids_complete"] is True
+
+
 def test_country_bar(client):
     r = client.post(
         "/analyze",
@@ -160,17 +115,6 @@ def test_country_bar(client):
         d["country"]: d["trial_count"] for d in body["visualization"]["data"]
     }
     assert by_country["United States"] == 3
-
-
-def test_grouped_bar_compare(client):
-    r = client.post(
-        "/analyze",
-        json={"query": "Compare Pembro vs Atezo by phase."},
-    )
-    body = r.json()
-    assert body["visualization"]["type"] == "grouped_bar_chart"
-    series = sorted({d["intervention_name"] for d in body["visualization"]["data"]})
-    assert series == ["Atezo", "Pembro"]
 
 
 def test_network_sponsor_drug(client):
@@ -188,6 +132,18 @@ def test_network_sponsor_drug(client):
     )
 
 
+def test_network_site_drug_endpoint(client):
+    r = client.post(
+        "/analyze",
+        json={"query": "Show trial sites and drugs."},
+    )
+    body = r.json()
+    assert body["visualization"]["type"] == "network_graph"
+    node_types = {n["type"] for n in body["visualization"]["nodes"]}
+    assert {"site", "drug"} <= node_types
+    assert body["visualization"]["edges"]
+
+
 def test_invalid_phase_rejected(client):
     r = client.post("/analyze", json={"query": "x", "phase": "not-a-phase"})
     assert r.status_code == 422
@@ -200,6 +156,45 @@ def test_phase_synonym_accepted(client):
     )
     assert r.status_code == 200
     assert r.json()["meta"]["filters_applied"]["phase"] == "PHASE3"
+
+
+def test_structured_small_enum_filters_are_applied(client):
+    r = client.post(
+        "/analyze",
+        json={
+            "query": "trials by phase",
+            "sponsor_class": "industry-sponsored",
+            "study_type": "interventional",
+            "sex": "female",
+            "intervention_type": "drug",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["filters_applied"]["sponsor_class"] == "INDUSTRY"
+    assert body["meta"]["filters_applied"]["study_type"] == "INTERVENTIONAL"
+    assert body["meta"]["filters_applied"]["sex"] == "FEMALE"
+    assert body["meta"]["filters_applied"]["intervention_type"] == "DRUG"
+    # In the fixture corpus, only NCT04 matches this full filter combination.
+    assert body["meta"]["total_studies_matched"] == 1
+
+
+def test_query_inferred_phase_and_sponsor_filters_are_applied(client):
+    r = client.post(
+        "/analyze",
+        json={
+            "query": (
+                "Which countries have the most Phase 3 industry-sponsored "
+                "recruiting trials?"
+            )
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["visualization"]["type"] == "bar_chart"
+    assert body["meta"]["filters_applied"]["phase"] == "PHASE3"
+    assert body["meta"]["filters_applied"]["status"] == "RECRUITING"
+    assert body["meta"]["filters_applied"]["sponsor_class"] == "INDUSTRY"
 
 
 def test_same_dim_filter_not_overwritten_by_fanout(client):
@@ -227,27 +222,26 @@ def test_same_dim_status_filter_not_overwritten(client):
 
 
 def test_sampled_flag_when_truncated(monkeypatch, client):
-    """Truncation only occurs when total > EXACT_PAGINATE_CAP. Force it
-    by mocking a much-larger corpus than the paginate-all ceiling."""
-    big_corpus = CORPUS * 700  # 2800 studies > 2000 cap
-
-    class BigClient(FakeClient):
-        async def search_studies(self, filters, max_studies=500, **_k):
-            return big_corpus[:max_studies], len(big_corpus)
-
-        async def count_for_filters(self, *_a, **_k):
-            return len(big_corpus)
-
-    monkeypatch.setattr(main_module, "CTGovClient", BigClient)
+    """Truncation now only occurs for viz types that still sample —
+    histogram and scatter (10k cap) and network (5k cap). Bar charts and
+    time series go through exact-fan-out paths. Force truncation on a
+    histogram by exceeding the numeric scan cap with a huge corpus."""
+    big_corpus = [
+        _study(f"NCT{i:06d}", enrollment_count=(i % 1000) + 10)
+        for i in range(11000)
+    ]
+    monkeypatch.setattr(main_module, "CTGovClient",
+                        make_fixed_corpus_client(big_corpus))
 
     r = client.post(
         "/analyze",
         json={
-            "query": "Which countries have the most trials?",
+            "query": "Distribution of enrollment sizes for cardiology trials.",
             "max_studies": 200,
         },
     )
     body = r.json()
+    assert body["visualization"]["type"] == "histogram"
     assert body["meta"]["truncated"] is True
     assert "(sampled)" in body["visualization"]["title"]
     for d in body["visualization"]["data"]:
@@ -314,17 +308,17 @@ def test_data_includes_supporting_nct_ids_and_citation_count(client):
     assert body["visualization"]["data"][0]["supporting_nct_ids_complete"] is False
 
 
-def test_aggregator_path_returns_complete_supporting_ids(client):
-    """High-cardinality dim (country) goes through Path C — IDs are
-    complete given the fetch window."""
+def test_country_exact_path_returns_sampled_support_ids(client):
+    """Country now uses exact countTotal fan-out; IDs are citation samples."""
     r = client.post(
         "/analyze",
         json={"query": "Which countries have the most trials?"},
     )
     body = r.json()
     for d in body["visualization"]["data"]:
-        assert d["supporting_nct_ids_complete"] is True
-        assert d["citation_count"] == len(d["supporting_nct_ids"])
+        assert d["sampled"] is False
+        assert d["supporting_nct_ids_complete"] is False
+        assert d["citation_count"] == d["trial_count"]
 
 
 def test_grouped_compare_distinct_total_uses_union(client):
@@ -360,20 +354,36 @@ def test_citations_have_url_and_source_field(client):
 
 
 def test_grouped_bar_uses_exact_fanout(client):
-    """Comparison must use exact per-cell counts (no sampling)."""
-    r = client.post(
-        "/analyze",
-        json={"query": "Compare Pembro vs Atezo by phase."},
-    )
+    """Comparison must produce a grouped_bar with exact per-cell counts."""
+    r = client.post("/analyze",
+                    json={"query": "Compare Pembro vs Atezo by phase."})
     body = r.json()
     assert body["visualization"]["type"] == "grouped_bar_chart"
+    series = sorted({d["intervention_name"] for d in body["visualization"]["data"]})
+    assert series == ["Atezo", "Pembro"]
     # exact path → no sampling, all data points marked sampled=False
     assert body["meta"]["truncated"] is False
-    for d in body["visualization"]["data"]:
-        assert d["sampled"] is False
-    # per-series totals reported
-    assert body["meta"]["per_series_totals"]
-    assert set(body["meta"]["per_series_totals"].keys()) == {"Pembro", "Atezo"}
+    assert all(d["sampled"] is False for d in body["visualization"]["data"])
+    assert set(body["meta"]["per_series_totals"]) == {"Pembro", "Atezo"}
+
+
+def test_grouped_bar_exact_fanout_zero_fills_cells(client):
+    r = client.post("/analyze",
+                    json={"query": "Compare Pembro vs Atezo by phase."})
+    body = r.json()
+    rows = {
+        (d["phase"], d["intervention_name"]): d["trial_count"]
+        for d in body["visualization"]["data"]
+    }
+    assert len(rows) == 12  # 2 series x 6 phase buckets
+    assert rows[("Phase 1", "Atezo")] == 0
+    assert rows[("Phase 4", "Pembro")] == 0
+    zero = next(
+        d for d in body["visualization"]["data"]
+        if d["phase"] == "Phase 4" and d["intervention_name"] == "Pembro"
+    )
+    assert zero["citations"] == []
+    assert zero["supporting_nct_ids_complete"] is True
 
 
 def test_network_meta_reports_caps(monkeypatch, client):
@@ -387,15 +397,8 @@ def test_network_meta_reports_caps(monkeypatch, client):
         )
         for i in range(900) for rep in range(3)
     ]
-
-    class BigClient(FakeClient):
-        async def search_studies(self, *_a, max_studies=500, **_k):
-            return big_corpus[:max_studies], len(big_corpus)
-
-        async def count_for_filters(self, *_a, **_k):
-            return len(big_corpus)
-
-    monkeypatch.setattr(main_module, "CTGovClient", BigClient)
+    monkeypatch.setattr(main_module, "CTGovClient",
+                        make_fixed_corpus_client(big_corpus))
     r = client.post("/analyze", json={"query": "sponsor drug network", "max_studies": 800})
     body = r.json()
     assert body["visualization"]["type"] == "network_graph"
@@ -405,10 +408,238 @@ def test_network_meta_reports_caps(monkeypatch, client):
     assert any("truncated" in w.lower() for w in meta["warnings"])
 
 
+def test_top_n_clips_network_edges_and_drops_orphan_nodes(monkeypatch, client):
+    """Network output must honor request top_n (edges → top N by weight),
+    and drop nodes whose only edges were clipped."""
+    big_corpus = [
+        _study(
+            f"NCT{i:05d}", lead_sponsor=f"Sponsor{i % 5}",
+            interventions=[{"name": f"Drug{i % 8}", "type": "DRUG"}],
+        )
+        for i in range(120)
+    ]
+    monkeypatch.setattr(main_module, "CTGovClient",
+                        make_fixed_corpus_client(big_corpus))
+    r = client.post(
+        "/analyze",
+        json={"query": "sponsor drug network", "top_n": 3, "max_studies": 200},
+    )
+    body = r.json()
+    edges = body["visualization"]["edges"]
+    nodes = body["visualization"]["nodes"]
+    assert len(edges) == 3
+    # All kept nodes must be referenced by at least one kept edge.
+    referenced = {n for e in edges for n in (e["source"], e["target"])}
+    assert {n["id"] for n in nodes} == referenced
+    # Edges sorted descending by weight.
+    weights = [e["weight"] for e in edges]
+    assert weights == sorted(weights, reverse=True)
+
+
+def test_top_n_clips_high_cardinality_buckets(client):
+    """top_n=1 keeps only the highest-trial-count country."""
+    r = client.post(
+        "/analyze",
+        json={"query": "Which countries have the most trials?", "top_n": 1},
+    )
+    body = r.json()
+    assert len(body["visualization"]["data"]) == 1
+    assert body["visualization"]["data"][0]["country"] == "United States"
+
+
+def test_scatter_datum_has_uniform_citation_fields(client):
+    r = client.post(
+        "/analyze",
+        json={"query": "Does enrollment correlate with trial duration?"},
+    )
+    body = r.json()
+    assert body["visualization"]["type"] == "scatter_plot"
+    for d in body["visualization"]["data"]:
+        for k in ("trial_count", "supporting_nct_ids",
+                  "supporting_nct_ids_complete", "citation_count", "citations"):
+            assert k in d
+
+
+def test_scatter_display_cap_adds_warning(monkeypatch, client):
+    corpus = [
+        _study(
+            f"NCTSCAT{i:04d}",
+            enrollment_count=10 + i,
+            start_date="2020-01-01",
+            completion_date=f"2021-{(i % 12) + 1:02d}-01",
+        )
+        for i in range(12)
+    ]
+    monkeypatch.setattr(main_module, "CTGovClient", make_fixed_corpus_client(corpus))
+    monkeypatch.setenv("CTGOV_SCATTER_POINT_CAP", "3")
+
+    r = client.post(
+        "/analyze",
+        json={"query": "Does enrollment correlate with trial duration?"},
+    )
+    body = r.json()
+
+    assert body["visualization"]["type"] == "scatter_plot"
+    assert len(body["visualization"]["data"]) == 3
+    assert body["meta"]["studies_used"] == 12
+    assert any("display-clipped to 3 of 12 points" in w for w in body["meta"]["warnings"])
+
+
+def test_network_edge_has_uniform_citation_fields(client):
+    r = client.post("/analyze", json={"query": "Show a network of sponsors and drugs."})
+    body = r.json()
+    assert body["visualization"]["type"] == "network_graph"
+    for e in body["visualization"]["edges"]:
+        for k in ("trial_count", "supporting_nct_ids",
+                  "supporting_nct_ids_complete", "citation_count", "citations"):
+            assert k in e
+
+
+@pytest.mark.parametrize("query,expected_dim", [
+    ("trials by sponsor class", "sponsor_class"),
+    ("trials by study type", "study_type"),
+    ("trials by sex", "sex"),
+    ("trials by intervention type", "intervention_type"),
+])
+def test_small_enum_bar_uses_exact_fanout(monkeypatch, query, expected_dim):
+    """sponsor_class / study_type / sex / intervention_type bar charts
+    must skip the sample-window path entirely — one countTotal per
+    bucket. With a corpus of 100 trials all having the same dim value,
+    the fake's filter-aware count_for_filters returns 100 only for that
+    bucket, 0 elsewhere — proving fan-out actually filtered."""
+    corpus = [
+        _study(
+            f"NCT{i:04d}",
+            sponsor_class="INDUSTRY", study_type="INTERVENTIONAL",
+            sex="ALL", intervention_types=["DRUG"],
+            interventions=[{"name": "DrugA", "type": "DRUG"}],
+        )
+        for i in range(100)
+    ]
+    monkeypatch.setattr(main_module, "CTGovClient",
+                        make_fake_client_class(corpus))
+    c = TestClient(main_module.app)
+    r = c.post("/analyze", json={"query": query, "max_studies": 50})
+    body = r.json()
+    assert body["visualization"]["type"] == "bar_chart"
+    assert body["meta"]["truncated"] is False
+    # Exact fan-out → only the populated bucket(s) make it through.
+    by_dim = {d[expected_dim]: d["trial_count"] for d in body["visualization"]["data"]}
+    assert sum(by_dim.values()) == 100
+    assert all(d["sampled"] is False for d in body["visualization"]["data"])
+
+
+def test_sponsor_top_n_uses_exact_fanout_not_sample_window(monkeypatch):
+    """High-cardinality sponsor rankings must come from per-candidate
+    countTotal queries — not from local aggregation over a sample window
+    that may miss the real leader."""
+    # Sample window contains mostly Sponsor A. The TRUE leader (Sponsor B)
+    # is hidden outside the sample. With Path A1 we discover candidates
+    # from the sample, then fan out exact counts; the FakeClient's
+    # filtered count_for_filters / search_studies tells us Sponsor B has
+    # more total trials.
+    sample_window = [
+        _study(f"NCTA{i:04d}", lead_sponsor="Sponsor A") for i in range(100)
+    ]
+    full_corpus = sample_window + [
+        _study(f"NCTB{i:04d}", lead_sponsor="Sponsor B") for i in range(500)
+    ]
+
+    class SkewedClient(FakeCTGovClient):
+        # Simulates sample-window bias: with no sponsor filter, return only
+        # the leading window (mostly Sponsor A). With a sponsor filter, return
+        # the true filtered count from the full corpus.
+        async def search_studies(self, filters, max_studies=500, **_k):
+            sel = (
+                [s for s in full_corpus if s["lead_sponsor"] == filters.sponsor]
+                if filters.sponsor else sample_window
+            )
+            return sel[:max_studies], len(sel)
+
+        async def count_for_filters(self, filters):
+            sel, total = await self.search_studies(filters, max_studies=1)
+            return total
+
+    monkeypatch.setattr(main_module, "CTGovClient", SkewedClient)
+    c = TestClient(main_module.app)
+    r = c.post(
+        "/analyze",
+        json={"query": "trials by sponsor", "max_studies": 50, "top_n": 5},
+    )
+    body = r.json()
+    assert body["visualization"]["type"] == "bar_chart"
+    by_sponsor = {
+        d["lead_sponsor"]: d["trial_count"]
+        for d in body["visualization"]["data"]
+    }
+    # Path A1 found Sponsor A in the sample, then fanned out countTotal.
+    # Sponsor A's exact count is 100 (its full filtered share), not the
+    # sampled 50.
+    assert by_sponsor["Sponsor A"] == 100
+    # Counts on shown candidates are exact — datum is not sampled.
+    for d in body["visualization"]["data"]:
+        assert d["sampled"] is False
+
+
+def test_time_series_default_range_is_surfaced(client):
+    """Time-series defaults (2010-current) must show in filters_applied
+    + a warning, so the user can see the implicit scope."""
+    r = client.post(
+        "/analyze",
+        json={"query": "How has the number of trials changed each year?"},
+    )
+    body = r.json()
+    fa = body["meta"]["filters_applied"]
+    assert "start_year" in fa and "end_year" in fa
+    assert fa["start_year"] == 2010
+    assert any("default" in w.lower() and "start_year" in w
+               for w in body["meta"]["warnings"])
+
+
+def test_time_series_explicit_range_no_default_warning(client):
+    r = client.post(
+        "/analyze",
+        json={
+            "query": "How has the number of trials changed each year?",
+            "start_year": 2018, "end_year": 2021,
+        },
+    )
+    body = r.json()
+    assert not any("default" in w.lower() and "start_year" in w
+                   for w in body["meta"]["warnings"])
+
+
+def test_network_truncation_surfaces_warning(monkeypatch, client):
+    """When the network is built from a sampled study set, the response
+    must include a warning explaining that edge weights are lower bounds.
+    Network has its own larger scan cap (CTGOV_NETWORK_SCAN_CAP=5000), so
+    we force truncation by exceeding it."""
+    big_corpus = [
+        _study(
+            f"NCT{i:05d}", lead_sponsor=f"Sponsor{i % 8}",
+            interventions=[{"name": f"Drug{i % 12}", "type": "DRUG"}],
+        )
+        for i in range(6000)
+    ]
+    monkeypatch.setattr(main_module, "CTGovClient",
+                        make_fixed_corpus_client(big_corpus))
+    r = client.post(
+        "/analyze",
+        json={"query": "sponsor drug network", "max_studies": 200},
+    )
+    body = r.json()
+    assert body["visualization"]["type"] == "network_graph"
+    assert body["meta"]["truncated"] is True
+    assert any("sampled" in w.lower() and "network" in w.lower()
+               for w in body["meta"]["warnings"])
+    for e in body["visualization"]["edges"]:
+        assert e["sampled"] is True
+
+
 def test_upstream_error_returns_502(monkeypatch, client):
     from app.ctgov import CTGovError
 
-    class BoomClient(FakeClient):
+    class BoomClient(FakeCTGovClient):
         async def search_studies(self, *_a, **_k):
             raise CTGovError("upstream unavailable", status_code=503)
 

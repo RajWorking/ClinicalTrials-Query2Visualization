@@ -59,6 +59,8 @@ VALID_PLAN_JSON = json.dumps({
         "drug_name": "Pembrolizumab",
         "condition": None, "sponsor": None, "country": None,
         "free_text": None, "phase": None, "status": None,
+        "sponsor_class": None, "study_type": None,
+        "sex": None, "intervention_type": None,
         "start_year": None, "end_year": None,
     },
     "aggregation": {

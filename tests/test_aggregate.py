@@ -8,29 +8,7 @@ from app.aggregate import (
 )
 from app.schemas import Aggregation, Filters, QueryPlan
 
-
-_BASE_STUDY = {
-    "nct_id": "NCT00000001", "brief_title": "A title",
-    "brief_summary": "Summary text", "phases": ["PHASE2"],
-    "study_type": "INTERVENTIONAL", "sex": "ALL",
-    "overall_status": "RECRUITING",
-    "start_date": "2020-05-01", "completion_date": "2022-05-01",
-    "enrollment_count": 100, "lead_sponsor": "Acme",
-    "sponsor_class": "INDUSTRY", "conditions": ["Cancer"],
-    "interventions": [{"name": "DrugA", "type": "DRUG"}],
-    "intervention_names": ["DrugA"], "intervention_types": ["DRUG"],
-    "countries": ["United States"],
-}
-
-
-def _study(**overrides):
-    s = {**_BASE_STUDY, **overrides}
-    # Keep interventions / intervention_names in sync when caller sets one only.
-    if "interventions" in overrides and "intervention_names" not in overrides:
-        s["intervention_names"] = [i["name"] for i in s["interventions"]]
-    if "intervention_names" in overrides and "interventions" not in overrides:
-        s["interventions"] = [{"name": n, "type": "DRUG"} for n in s["intervention_names"]]
-    return s
+from ._helpers import make_study as _study
 
 
 def _plan(**agg) -> QueryPlan:
@@ -197,6 +175,111 @@ def test_network_drug_drug_cooccurrence():
     assert edges[("a", "b")] == 2
     assert edges[("a", "c")] == 1
     assert edges[("b", "c")] == 1
+
+
+def test_network_site_drug():
+    studies = [
+        _study(
+            nct_id="NCT01",
+            interventions=[{"name": "Pembrolizumab", "type": "DRUG"}],
+            locations=[{
+                "facility": "Memorial Cancer Center",
+                "city": "New York",
+                "state": "NY",
+                "country": "United States",
+            }],
+            countries=["United States"],
+        ),
+        _study(
+            nct_id="NCT02",
+            interventions=[{"name": "Pembrolizumab", "type": "DRUG"}],
+            locations=[{
+                "facility": "Memorial Cancer Center",
+                "city": "New York",
+                "state": "NY",
+                "country": "United States",
+            }],
+            countries=["United States"],
+        ),
+    ]
+    out = build_network(studies, _plan(network_kind="site_drug"))
+    types = {n["id"]: n["type"] for n in out["nodes"]}
+    site_id = next(node_id for node_id, typ in types.items() if typ == "site")
+    assert types["pembrolizumab"] == "drug"
+    edge = next(e for e in out["edges"] if e["source"] == site_id)
+    assert edge["target"] == "pembrolizumab"
+    assert edge["weight"] == 2
+    assert "locations" in edge["citations"][0]["source_field"]
+    assert "interventions" in edge["citations"][0]["source_field"]
+
+
+def test_network_canonicalizes_salt_forms():
+    """Drug salt / hydrate variants should collapse to the parent INN node.
+
+    Real CT.gov data routinely lists e.g. 'Dabrafenib' and 'Dabrafenib Mesylate'
+    as separate interventions on related studies, polluting the graph with
+    duplicate drug nodes.
+    """
+    studies = [
+        _study(nct_id="NCT01", lead_sponsor="GSK",
+               interventions=[{"name": "Dabrafenib", "type": "DRUG"}]),
+        _study(nct_id="NCT02", lead_sponsor="GSK",
+               interventions=[{"name": "Dabrafenib Mesylate", "type": "DRUG"}]),
+        _study(nct_id="NCT03", lead_sponsor="Exelixis",
+               interventions=[{"name": "Cabozantinib S-malate", "type": "DRUG"}]),
+        _study(nct_id="NCT04", lead_sponsor="Exelixis",
+               interventions=[{"name": "Cabozantinib", "type": "DRUG"}]),
+        _study(nct_id="NCT05", lead_sponsor="Acme",
+               interventions=[{"name": "Fludarabine phosphate monohydrate",
+                               "type": "DRUG"}]),
+        _study(nct_id="NCT06", lead_sponsor="Acme",
+               interventions=[{"name": "Fludarabine", "type": "DRUG"}]),
+    ]
+    out = build_network(studies, _plan(network_kind="sponsor_drug"))
+    drug_nodes = {n["id"] for n in out["nodes"] if n["type"] == "drug"}
+    assert drug_nodes == {"dabrafenib", "cabozantinib", "fludarabine"}
+
+
+def test_network_blocks_mesh_artifacts():
+    """MeSH umbrella terms and procedure-like interventions must not appear."""
+    studies = [
+        _study(
+            nct_id="NCT01", lead_sponsor="Acme",
+            interventions=[{"name": "Pembrolizumab", "type": "DRUG"}],
+            intervention_mesh=[
+                "Pembrolizumab",            # real drug — keep
+                "Antineoplastic Agents",    # MeSH umbrella — drop
+                "Cancer Vaccines",           # MeSH umbrella — drop
+                "Immunoglobulin G",          # broad class — drop
+                "CTLA-4 Antigen",            # antigen target — drop
+                "Introns",                    # biological structure — drop
+                "Disulfides",                 # chemical class — drop
+                "Blood Specimen Collection", # procedure — drop
+                "Gene Expression Profiling",  # procedure — drop
+                "Immunohistochemistry",       # procedure — drop
+            ],
+        ),
+    ]
+    out = build_network(studies, _plan(network_kind="sponsor_drug"))
+    drug_nodes = {n["id"] for n in out["nodes"] if n["type"] == "drug"}
+    assert drug_nodes == {"pembrolizumab"}
+
+
+def test_network_edges_carry_sampled_flag():
+    """Edges must expose `sampled` for parity with bar/time-series datums.
+
+    The network builder itself emits sampled=False; the request handler
+    flips it when the underlying study set was truncated.
+    """
+    studies = [
+        _study(nct_id="NCT01", lead_sponsor="Merck",
+               interventions=[{"name": "Pembro", "type": "DRUG"}]),
+    ]
+    out = build_network(studies, _plan(network_kind="sponsor_drug"))
+    assert out["edges"]
+    for e in out["edges"]:
+        assert "sampled" in e
+        assert e["sampled"] is False
 
 
 def test_network_filters_non_drug_interventions():

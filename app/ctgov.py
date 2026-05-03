@@ -32,8 +32,9 @@ DEFAULT_HEADERS = {
 DEFAULT_FIELDS = [
     "NCTId", "BriefTitle", "BriefSummary", "Phase", "OverallStatus",
     "StartDate", "CompletionDate", "EnrollmentCount", "LeadSponsorName",
-    "LeadSponsorClass", "LocationCountry", "Condition", "InterventionName",
-    "InterventionType", "StudyType", "Sex", "InterventionMeshTerm",
+    "LeadSponsorClass", "LocationFacility", "LocationCity", "LocationState",
+    "LocationCountry", "Condition", "InterventionName", "InterventionType",
+    "StudyType", "Sex", "InterventionMeshTerm",
 ]
 
 # In-process TTL cache, keyed by sorted (path, params).
@@ -44,6 +45,11 @@ _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 # Per-event-loop semaphore caps in-flight requests on fan-out paths.
 _CONCURRENCY = int(os.environ.get("CTGOV_CONCURRENCY", "8"))
 _SEM_BY_LOOP: dict[int, asyncio.Semaphore] = {}
+
+# Sticky transport routing: once a CDN edge has 403'd httpx in this process,
+# we stop trying httpx first — that probe costs an RTT every request and
+# makes the live smoke noisy. Reset the flag on process restart.
+_PREFER_URLLIB = False
 
 
 def _get_semaphore() -> asyncio.Semaphore:
@@ -103,6 +109,14 @@ def filters_to_params(f: Filters) -> dict[str, str]:
     advanced: list[str] = []
     if f.phase:
         advanced.append(f"AREA[Phase]{f.phase.upper()}")
+    if f.sponsor_class:
+        advanced.append(f"AREA[LeadSponsorClass]{f.sponsor_class.upper()}")
+    if f.study_type:
+        advanced.append(f"AREA[StudyType]{f.study_type.upper()}")
+    if f.sex:
+        advanced.append(f"AREA[Sex]{f.sex.upper()}")
+    if f.intervention_type:
+        advanced.append(f"AREA[InterventionType]{f.intervention_type.upper()}")
     if f.start_year and f.end_year:
         advanced.append(f"AREA[StartDate]RANGE[{f.start_year}-01-01,{f.end_year}-12-31]")
     elif f.start_year:
@@ -134,6 +148,20 @@ def normalize(study: dict[str, Any]) -> dict[str, Any]:
         for i in (arms.get("interventions") or [])
         if i.get("name")
     ]
+    locations = []
+    for loc in (locs.get("locations") or []):
+        country = loc.get("country")
+        facility = loc.get("facility")
+        city = loc.get("city")
+        state = loc.get("state")
+        if country or facility or city:
+            locations.append({
+                "facility": facility,
+                "city": city,
+                "state": state,
+                "country": country,
+            })
+
     return {
         "nct_id": ident.get("nctId"),
         "brief_title": ident.get("briefTitle"),
@@ -154,8 +182,9 @@ def normalize(study: dict[str, Any]) -> dict[str, Any]:
         "intervention_mesh": [
             m.get("term") for m in (intr_browse.get("meshes") or []) if m.get("term")
         ],
+        "locations": locations,
         "countries": sorted({
-            loc.get("country") for loc in (locs.get("locations") or []) if loc.get("country")
+            loc.get("country") for loc in locations if loc.get("country")
         }),
     }
 
@@ -188,7 +217,13 @@ class CTGovClient:
         return result
 
     async def _do_get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        global _PREFER_URLLIB
         assert self._client is not None
+        # Sticky transport: once we've seen a 403 in this process, route
+        # straight to urllib so we don't waste an RTT on every request
+        # discovering the CDN still hates httpx.
+        if _PREFER_URLLIB:
+            return await asyncio.to_thread(_get_via_urllib, path, params)
         last_err: Optional[Exception] = None
         last_status: Optional[int] = None
         for attempt in range(3):
@@ -202,8 +237,17 @@ class CTGovClient:
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
                 if r.status_code == 403:
-                    # Some CDN edges block httpx specifically; fall back to urllib.
-                    logger.warning("httpx got 403 from %s — using urllib fallback.", path)
+                    # Some CDN edges block httpx specifically; fall back to
+                    # urllib AND remember the preference so subsequent
+                    # requests go straight there (the smoke previously paid
+                    # the 403 RTT on every fan-out cell).
+                    if not _PREFER_URLLIB:
+                        logger.warning(
+                            "httpx got 403 from %s — switching this process "
+                            "to urllib transport for subsequent requests.",
+                            path,
+                        )
+                        _PREFER_URLLIB = True
                     return await asyncio.to_thread(_get_via_urllib, path, params)
                 r.raise_for_status()
                 return r.json()
