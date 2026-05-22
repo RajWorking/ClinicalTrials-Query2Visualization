@@ -99,7 +99,6 @@ _STRUCTURED_FORMATTERS: dict[str, Callable[[dict], Optional[str]]] = {
     "sponsor_class": lambda s: f"leadSponsorClass: {_label(s['sponsor_class'], SPONSOR_CLASS_LABELS)}" if s.get("sponsor_class") else None,
     "country": lambda s: _list_with_more(s["countries"], "locations") if s.get("countries") else None,
     "condition": lambda s: _list_with_more(s["conditions"], "conditions") if s.get("conditions") else None,
-    "site": lambda s: _list_with_more(_site_labels(s), "sites") if _site_labels(s) else None,
     "intervention_type": lambda s: _list_with_more(_labels(s["intervention_types"], INTERVENTION_TYPE_LABELS), "interventionTypes") if s.get("intervention_types") else None,
     "intervention_name": lambda s: _list_with_more(s["intervention_names"], "interventions") if s.get("intervention_names") else None,
     "year": lambda s: f"startDate: {s['start_date']}" if s.get("start_date") else None,

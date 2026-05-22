@@ -3,52 +3,32 @@ from __future__ import annotations
 
 import re
 
+# Three of the eleven InterventionType values in the CT.gov v2 API that
+# represent pharmacological agents. The remaining eight (DEVICE, PROCEDURE,
+# RADIATION, BEHAVIORAL, GENETIC, DIETARY_SUPPLEMENT, DIAGNOSTIC_TEST, OTHER)
+# are not drug-like and are excluded from drug network nodes.
 DRUG_LIKE_TYPES = {"DRUG", "BIOLOGICAL", "COMBINATION_PRODUCT"}
 
-# Names (canonicalized) that don't identify a specific molecule.
-DRUG_NAME_BLOCKLIST = {
-    # placebo / control / vehicle
-    "placebo", "saline", "vehicle", "normal saline", "matching placebo",
-    "placebo control", "placebo comparator", "control", "control arm",
-    "no intervention", "sham", "sham comparator", "untreated", "active comparator",
-    # supportive / SOC
-    "best supportive care", "supportive care", "standard of care", "soc",
-    "standard therapy", "standard treatment", "usual care",
-    # biospecimens / procedures often miscoded as DRUG (or MeSH-tagged onto a trial)
-    "blood sample", "blood draw", "blood specimen collection",
-    "biopsy", "tumor biopsy", "tissue biopsy",
-    "questionnaire", "survey", "observation", "exercise", "education", "counseling",
-    "imaging", "ct scan", "mri", "pet scan", "ultrasound", "x-ray",
-    "biomarker analysis", "biomarker assessment", "laboratory biomarker analysis",
-    "gene expression profiling", "immunohistochemistry", "flow cytometry",
-    "pharmacological study", "pharmacokinetic study",
-    # broad classes / MeSH umbrella terms (not a specific molecule)
-    "chemotherapy", "chemo", "radiotherapy", "radiation", "radiation therapy",
-    "immunotherapy", "targeted therapy", "combination chemotherapy",
-    "antineoplastic agents", "antineoplastic", "antibodies", "antibodies monoclonal",
-    "monoclonal antibodies", "cancer vaccines", "vaccines",
-    "colony-stimulating factors", "immunoglobulin g", "immunoglobulins",
-    "cytokines", "interleukins", "interferons", "growth factors",
-    "adjuvants immunologic", "adjuvants",
-    "antigens", "ctla-4 antigen", "gp100 antigen", "pd-l1 antigen",
-    "introns", "exons", "rna", "dna",  # MeSH biological structures
-    "disulfides", "sulfides", "salts",  # chemical classes
-    "investigator's choice", "physician's choice", "patient's choice",
-    # arm-label artifacts
-    "arm a", "arm b", "arm c", "arm 1", "arm 2", "arm 3",
-    "cohort a", "cohort b", "cohort 1", "cohort 2",
-    "experimental arm", "experimental", "treatment", "intervention",
-}
-
+# CT.gov protocols with multiple arms frequently enter the arm label as an
+# intervention name (e.g., "Arm A", "Cohort 1", "Group 2", "Part 1") rather
+# than the actual drug. This pattern catches those artifacts before they
+# become spurious network nodes.
 _ARM_LABEL_PATTERN = re.compile(
     r"^(?:arm|cohort|group|stage|part|step)\s*[a-z0-9\-]+$", re.IGNORECASE,
 )
 
+# Standard pharmaceutical route-of-administration and dosage-form terms.
+# CT.gov sponsors enter these as part of the intervention name
+# (e.g., "Pembrolizumab 200 mg IV infusion"). Stripping them lets
+# "Pembrolizumab 200 mg injection" and "Pembrolizumab" collapse to the
+# same canonical node.
 _DOSAGE_FORMS = (
     r"injection|infusion|tablet|tablets|capsule|capsules|solution|"
     r"suspension|cream|ointment|gel|patch|spray|drops|inhaler|"
     r"oral|iv|i\.v\.|subcutaneous|sc|sublingual"
 )
+# Standard drug dosing notation: mg/mcg/g/ml/kg/IU/% for fixed doses;
+# mg/m² and mg/kg for BSA- and weight-adjusted dosing.
 _DOSE_PATTERN = re.compile(
     r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|kg|iu|units|%|mg/m2|mg/kg)\b",
     re.IGNORECASE,
@@ -58,8 +38,20 @@ _PAREN_PATTERN = re.compile(r"\([^)]*\)")
 _BRACKET_PATTERN = re.compile(r"\[[^\]]*\]")
 _WHITESPACE = re.compile(r"\s+")
 
-# Salt / ester / hydrate suffixes are stripped from the end so related
-# salt-form names collapse to the parent INN.
+# Pharmaceutical salt, ester, and hydration-state suffixes. WHO INN
+# (International Nonproprietary Name) is the global standard identifier for
+# a drug substance and never includes the salt form. CT.gov sponsors often
+# register the formulated salt name (e.g., "Imatinib Mesylate", "Cabozantinib
+# S-malate") rather than the INN stem. Stripping these collapses salt variants
+# to the parent INN so they resolve to one network node.
+#   - Acid-addition salts: mesylate (methanesulfonate), besylate
+#     (benzenesulfonate), tosylate (p-toluenesulfonate), fumarate, maleate,
+#     succinate, tartrate, citrate, acetate, gluconate, lactate, nitrate,
+#     hydrochloride (HCl), hydrobromide, sulfate/sulphate, phosphate
+#   - Metal salts: sodium, potassium, calcium, disodium, dipotassium,
+#     chloride, bromide, iodide
+#   - Malate forms: s-malate (used for cabozantinib), malate
+#   - Hydration states: mono/di/trihydrate, hemihydrate, hydrate, anhydrous
 _SALT_SUFFIX = re.compile(
     r"\s+(?:"
     r"mesylate|besylate|tosylate|fumarate|maleate|succinate|tartrate|"
@@ -92,16 +84,15 @@ def canonicalize_drug(name: str) -> str:
 
 
 def _is_specific_drug_name(name: str, canon: str) -> bool:
-    return bool(canon and canon not in DRUG_NAME_BLOCKLIST
-                and not _ARM_LABEL_PATTERN.match(name))
+    return bool(canon and not _ARM_LABEL_PATTERN.match(name))
 
 
 def drug_names(study: dict) -> list[tuple[str, str]]:
     """Drug-like interventions as (canonical_id, display_label), deduped per study.
 
-    Filters non-drug intervention types, arm-label artifacts, and blocklisted
-    names. When a MeSH term shares a canonical form with an intervention, the
-    MeSH form wins as the display label.
+    Filters non-drug intervention types and arm-label artifacts. When a MeSH
+    term shares a canonical form with an intervention, the MeSH form wins as
+    the display label.
     """
     mesh_terms = [
         (t or "").strip()

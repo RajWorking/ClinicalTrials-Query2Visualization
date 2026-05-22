@@ -3,7 +3,92 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.schemas import Filters
+from app.planner import merge_user_overrides
+from app.schemas import AnalyzeRequest, Aggregation, Filters, QueryPlan
+
+
+def plan_query_for(plan: QueryPlan):
+    """Return a test planner that always yields the provided plan."""
+    def _plan(req: AnalyzeRequest) -> QueryPlan:
+        return merge_user_overrides(plan.model_copy(deep=True), req)
+    return _plan
+
+
+def make_plan(
+    visualization_type: str,
+    *,
+    group_by: str | None = None,
+    series: str | None = None,
+    series_values: list[str] | None = None,
+    x_field: str | None = None,
+    y_field: str | None = None,
+    bin_count: int = 10,
+    network_kind: str | None = None,
+    filters: Filters | None = None,
+    title: str | None = None,
+) -> QueryPlan:
+    return QueryPlan(
+        visualization_type=visualization_type,  # type: ignore[arg-type]
+        title=title or f"Test {visualization_type}",
+        query_interpretation="Test plan.",
+        filters=filters or Filters(),
+        aggregation=Aggregation(
+            group_by=group_by,  # type: ignore[arg-type]
+            series=series,  # type: ignore[arg-type]
+            series_values=series_values,
+            x_field=x_field,  # type: ignore[arg-type]
+            y_field=y_field,  # type: ignore[arg-type]
+            bin_count=bin_count,
+            network_kind=network_kind,  # type: ignore[arg-type]
+        ),
+    )
+
+
+def bar_plan(group_by: str = "phase", *, filters: Filters | None = None) -> QueryPlan:
+    return make_plan("bar_chart", group_by=group_by, filters=filters)
+
+
+def time_series_plan(*, filters: Filters | None = None) -> QueryPlan:
+    return make_plan("time_series", group_by="year", filters=filters)
+
+
+def grouped_compare_plan(
+    *,
+    group_by: str = "phase",
+    series_values: list[str] | None = None,
+    filters: Filters | None = None,
+) -> QueryPlan:
+    return make_plan(
+        "grouped_bar_chart",
+        group_by=group_by,
+        series="intervention_name",
+        series_values=series_values or ["Pembro", "Atezo"],
+        filters=filters,
+    )
+
+
+def network_plan(
+    network_kind: str = "sponsor_drug", *, filters: Filters | None = None,
+) -> QueryPlan:
+    return make_plan("network_graph", network_kind=network_kind, filters=filters)
+
+
+def histogram_plan(*, filters: Filters | None = None) -> QueryPlan:
+    return make_plan(
+        "histogram",
+        x_field="enrollment_count",
+        bin_count=12,
+        filters=filters,
+    )
+
+
+def scatter_plan(*, filters: Filters | None = None) -> QueryPlan:
+    return make_plan(
+        "scatter_plot",
+        x_field="duration_months",
+        y_field="enrollment_count",
+        filters=filters,
+    )
 
 
 _BASE_STUDY: dict[str, Any] = {

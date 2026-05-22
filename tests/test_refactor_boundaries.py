@@ -39,10 +39,9 @@ def test_drug_canonicalization_and_extraction_boundaries():
     study = _study(
         interventions=[
             {"name": "PEMBROLIZUMAB 200 mg injection", "type": "DRUG"},
-            {"name": "Arm A", "type": "DRUG"},
-            {"name": "MRI scan", "type": "DIAGNOSTIC_TEST"},
-            {"name": "Cancer Vaccines", "type": "DRUG"},
+            {"name": "Arm A", "type": "DRUG"},           # filtered by arm-label regex
+            {"name": "MRI scan", "type": "DIAGNOSTIC_TEST"},  # filtered by type
         ],
-        intervention_mesh=["pembrolizumab", "Antineoplastic Agents"],
+        intervention_mesh=["pembrolizumab"],
     )
     assert drug_names(study) == [("pembrolizumab", "pembrolizumab")]

@@ -97,7 +97,14 @@ class AnalyzeRequest(_PhaseStatusModel):
     )
     start_year: Optional[int] = Field(None, ge=1900, le=2100)
     end_year: Optional[int] = Field(None, ge=1900, le=2100)
-    max_studies: int = Field(500, ge=1, le=2000)
+    max_studies: int = Field(
+        500, ge=1, le=2000,
+        description=(
+            "Minimum number of matching studies to scan on sampled execution "
+            "paths. Exact-count paths may ignore this and use CT.gov "
+            "countTotal fan-out instead."
+        ),
+    )
     top_n: Optional[int] = Field(
         None, ge=1, le=200,
         description="If set, bar/grouped_bar/network output is clipped to the "

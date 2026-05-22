@@ -15,7 +15,6 @@ from typing import Any, Iterable, Optional
 
 import httpx
 
-from .aliases import normalize_condition, normalize_drug
 from .schemas import Filters
 
 BASE = "https://clinicaltrials.gov/api/v2"
@@ -92,12 +91,12 @@ class CTGovError(RuntimeError):
 
 
 def filters_to_params(f: Filters) -> dict[str, str]:
-    """Map Filters to v2 query/filter params (with brand/abbrev alias normalization)."""
+    """Map Filters to v2 query/filter params."""
     p: dict[str, str] = {}
-    if (cond := normalize_condition(f.condition)):
-        p["query.cond"] = cond
-    if (drug := normalize_drug(f.drug_name)):
-        p["query.intr"] = drug
+    if f.condition:
+        p["query.cond"] = f.condition
+    if f.drug_name:
+        p["query.intr"] = f.drug_name
     if f.sponsor:
         p["query.spons"] = f.sponsor
     if f.country:

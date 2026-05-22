@@ -111,20 +111,6 @@ def test_network_sponsor_drug():
     assert labels["pembro"] == "Pembro"
 
 
-def test_network_filters_class_name_chemotherapy():
-    """Generic class names like 'Chemotherapy' must be filtered from drug nodes."""
-    studies = [
-        _study(nct_id="NCT01", lead_sponsor="Merck",
-               interventions=[
-                   {"name": "Pembrolizumab", "type": "DRUG"},
-                   {"name": "Chemotherapy", "type": "DRUG"},
-                   {"name": "Arm A", "type": "DRUG"},  # arm-label artifact
-               ]),
-    ]
-    out = build_network(studies, _plan(network_kind="sponsor_drug"))
-    drug_nodes = {n["id"] for n in out["nodes"] if n["type"] == "drug"}
-    assert drug_nodes == {"pembrolizumab"}
-
 
 def test_network_canonicalizes_dosage_form_variants():
     """Pembrolizumab / pembrolizumab / Pembrolizumab 200 mg → one node."""
@@ -240,30 +226,6 @@ def test_network_canonicalizes_salt_forms():
     assert drug_nodes == {"dabrafenib", "cabozantinib", "fludarabine"}
 
 
-def test_network_blocks_mesh_artifacts():
-    """MeSH umbrella terms and procedure-like interventions must not appear."""
-    studies = [
-        _study(
-            nct_id="NCT01", lead_sponsor="Acme",
-            interventions=[{"name": "Pembrolizumab", "type": "DRUG"}],
-            intervention_mesh=[
-                "Pembrolizumab",            # real drug — keep
-                "Antineoplastic Agents",    # MeSH umbrella — drop
-                "Cancer Vaccines",           # MeSH umbrella — drop
-                "Immunoglobulin G",          # broad class — drop
-                "CTLA-4 Antigen",            # antigen target — drop
-                "Introns",                    # biological structure — drop
-                "Disulfides",                 # chemical class — drop
-                "Blood Specimen Collection", # procedure — drop
-                "Gene Expression Profiling",  # procedure — drop
-                "Immunohistochemistry",       # procedure — drop
-            ],
-        ),
-    ]
-    out = build_network(studies, _plan(network_kind="sponsor_drug"))
-    drug_nodes = {n["id"] for n in out["nodes"] if n["type"] == "drug"}
-    assert drug_nodes == {"pembrolizumab"}
-
 
 def test_network_edges_carry_sampled_flag():
     """Edges must expose `sampled` for parity with bar/time-series datums.
@@ -283,7 +245,7 @@ def test_network_edges_carry_sampled_flag():
 
 
 def test_network_filters_non_drug_interventions():
-    """Procedures and placebos must not appear as drug nodes."""
+    """Non-drug intervention types must not appear as drug nodes."""
     studies = [
         _study(
             nct_id="NCT01", lead_sponsor="Acme",
@@ -291,7 +253,6 @@ def test_network_filters_non_drug_interventions():
                 {"name": "DrugX", "type": "DRUG"},
                 {"name": "Surgery A", "type": "PROCEDURE"},
                 {"name": "MRI scan", "type": "DIAGNOSTIC_TEST"},
-                {"name": "Placebo", "type": "DRUG"},  # name-based exclusion
             ],
         ),
     ]

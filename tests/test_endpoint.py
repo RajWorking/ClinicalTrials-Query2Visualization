@@ -1,18 +1,14 @@
 """End-to-end integration tests against /analyze with a mocked CT.gov client."""
 from __future__ import annotations
 
-import os
-
 import pytest
 from fastapi.testclient import TestClient
 
-os.environ["STUB_LLM"] = "1"  # tests don't need an OpenAI key
-
-from app import main as main_module  # noqa: E402
-
-from ._helpers import (  # noqa: E402
-    FakeCTGovClient, make_fake_client_class, make_fixed_corpus_client,
-    make_study as _study,
+from app import main as main_module
+from ._helpers import (
+    FakeCTGovClient, bar_plan, grouped_compare_plan, histogram_plan,
+    make_fake_client_class, make_fixed_corpus_client, make_study as _study,
+    network_plan, plan_query_for, scatter_plan, time_series_plan,
 )
 
 
@@ -41,8 +37,16 @@ FakeClient = make_fake_client_class(CORPUS)
 
 
 @pytest.fixture
-def client(monkeypatch) -> TestClient:
+def set_plan(monkeypatch):
+    def _set(plan):
+        monkeypatch.setattr(main_module, "plan_query", plan_query_for(plan))
+    return _set
+
+
+@pytest.fixture
+def client(monkeypatch, set_plan) -> TestClient:
     monkeypatch.setattr(main_module, "CTGovClient", FakeClient)
+    set_plan(bar_plan("phase"))
     return TestClient(main_module.app)
 
 
@@ -51,6 +55,19 @@ def client(monkeypatch) -> TestClient:
 
 def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+def test_planner_error_returns_502_without_visualization(monkeypatch, client):
+    def boom(_req):
+        raise main_module.PlannerError("401 unauthorized")
+
+    monkeypatch.setattr(main_module, "plan_query", boom)
+    r = client.post("/analyze", json={"query": "phase distribution"})
+
+    assert r.status_code == 502
+    body = r.json()
+    assert "visualization" not in body
+    assert "401 unauthorized" in body["detail"]
 
 
 def test_bar_phase_uses_exact_count_path(client):
@@ -69,7 +86,8 @@ def test_bar_phase_uses_exact_count_path(client):
     assert all(d["citations"] for d in body["visualization"]["data"])
 
 
-def test_time_series_path(client):
+def test_time_series_path(client, set_plan):
+    set_plan(time_series_plan())
     r = client.post(
         "/analyze",
         json={
@@ -87,7 +105,8 @@ def test_time_series_path(client):
     assert all(d["sampled"] is False for d in body["visualization"]["data"])
 
 
-def test_time_series_zero_fills_missing_years(client):
+def test_time_series_zero_fills_missing_years(client, set_plan):
+    set_plan(time_series_plan())
     r = client.post(
         "/analyze",
         json={
@@ -104,7 +123,8 @@ def test_time_series_zero_fills_missing_years(client):
     assert years["2017"]["supporting_nct_ids_complete"] is True
 
 
-def test_country_bar(client):
+def test_country_bar(client, set_plan):
+    set_plan(bar_plan("country"))
     r = client.post(
         "/analyze",
         json={"query": "Which countries have the most trials?", "max_studies": 50},
@@ -117,7 +137,8 @@ def test_country_bar(client):
     assert by_country["United States"] == 3
 
 
-def test_network_sponsor_drug(client):
+def test_network_sponsor_drug(client, set_plan):
+    set_plan(network_plan("sponsor_drug"))
     r = client.post(
         "/analyze",
         json={"query": "Show a network of sponsors and drugs."},
@@ -132,7 +153,8 @@ def test_network_sponsor_drug(client):
     )
 
 
-def test_network_site_drug_endpoint(client):
+def test_network_site_drug_endpoint(client, set_plan):
+    set_plan(network_plan("site_drug"))
     r = client.post(
         "/analyze",
         json={"query": "Show trial sites and drugs."},
@@ -179,14 +201,15 @@ def test_structured_small_enum_filters_are_applied(client):
     assert body["meta"]["total_studies_matched"] == 1
 
 
-def test_query_inferred_phase_and_sponsor_filters_are_applied(client):
+def test_structured_phase_status_sponsor_filters_are_applied(client, set_plan):
+    set_plan(bar_plan("country"))
     r = client.post(
         "/analyze",
         json={
-            "query": (
-                "Which countries have the most Phase 3 industry-sponsored "
-                "recruiting trials?"
-            )
+            "query": "Which countries have the most matching trials?",
+            "phase": "PHASE3",
+            "status": "RECRUITING",
+            "sponsor_class": "INDUSTRY",
         },
     )
     assert r.status_code == 200
@@ -210,7 +233,8 @@ def test_same_dim_filter_not_overwritten_by_fanout(client):
     assert body["meta"]["filters_applied"]["phase"] == "PHASE3"
 
 
-def test_same_dim_status_filter_not_overwritten(client):
+def test_same_dim_status_filter_not_overwritten(client, set_plan):
+    set_plan(bar_plan("overall_status"))
     r = client.post(
         "/analyze",
         json={"query": "trials by status", "status": "RECRUITING"},
@@ -221,7 +245,8 @@ def test_same_dim_status_filter_not_overwritten(client):
     assert statuses == {"Recruiting"}
 
 
-def test_sampled_flag_when_truncated(monkeypatch, client):
+def test_sampled_flag_when_truncated(monkeypatch, client, set_plan):
+    set_plan(histogram_plan())
     """Truncation now only occurs for viz types that still sample —
     histogram and scatter (10k cap) and network (5k cap). Bar charts and
     time series go through exact-fan-out paths. Force truncation on a
@@ -250,7 +275,8 @@ def test_sampled_flag_when_truncated(monkeypatch, client):
     assert any("sampled" in w.lower() for w in body["meta"]["warnings"])
 
 
-def test_paginate_all_when_total_below_cap(client):
+def test_paginate_all_when_total_below_cap(client, set_plan):
+    set_plan(bar_plan("country"))
     """When matched total fits below the paginate-all cap, no sampling."""
     r = client.post(
         "/analyze",
@@ -263,20 +289,6 @@ def test_paginate_all_when_total_below_cap(client):
     assert body["meta"]["truncated"] is False
     assert body["meta"]["studies_used"] == 4
 
-
-def test_planner_fallback_warning_surfaced(monkeypatch, client):
-    """When the planner falls back, the response must say so."""
-    from app import planner
-
-    def boom(_req):
-        raise RuntimeError("forced stub error")
-
-    monkeypatch.setattr(planner, "_stub_plan", boom)
-    r = client.post("/analyze", json={"query": "uninterpretable nonsense"})
-    assert r.status_code == 200
-    body = r.json()
-    assert any("fallback" in w.lower() or "default" in w.lower()
-               for w in body["meta"]["warnings"])
 
 
 def test_citation_excerpt_references_supporting_field(client):
@@ -308,8 +320,9 @@ def test_data_includes_supporting_nct_ids_and_citation_count(client):
     assert body["visualization"]["data"][0]["supporting_nct_ids_complete"] is False
 
 
-def test_country_exact_path_returns_sampled_support_ids(client):
-    """Country now uses exact countTotal fan-out; IDs are citation samples."""
+def test_country_candidate_fanout_returns_sampled_support_ids(client, set_plan):
+    """Country rankings use candidate discovery plus exact per-candidate counts."""
+    set_plan(bar_plan("country"))
     r = client.post(
         "/analyze",
         json={"query": "Which countries have the most trials?"},
@@ -321,7 +334,8 @@ def test_country_exact_path_returns_sampled_support_ids(client):
         assert d["citation_count"] == d["trial_count"]
 
 
-def test_grouped_compare_distinct_total_uses_union(client):
+def test_grouped_compare_distinct_total_uses_union(client, set_plan):
+    set_plan(grouped_compare_plan())
     """distinct_total = |union(IDs)| across compared series, not max."""
     r = client.post(
         "/analyze",
@@ -353,7 +367,8 @@ def test_citations_have_url_and_source_field(client):
     assert seen_phase_path, "expected at least one citation to point at the phases field"
 
 
-def test_grouped_bar_uses_exact_fanout(client):
+def test_grouped_bar_uses_exact_fanout(client, set_plan):
+    set_plan(grouped_compare_plan())
     """Comparison must produce a grouped_bar with exact per-cell counts."""
     r = client.post("/analyze",
                     json={"query": "Compare Pembro vs Atezo by phase."})
@@ -367,7 +382,8 @@ def test_grouped_bar_uses_exact_fanout(client):
     assert set(body["meta"]["per_series_totals"]) == {"Pembro", "Atezo"}
 
 
-def test_grouped_bar_exact_fanout_zero_fills_cells(client):
+def test_grouped_bar_exact_fanout_zero_fills_cells(client, set_plan):
+    set_plan(grouped_compare_plan())
     r = client.post("/analyze",
                     json={"query": "Compare Pembro vs Atezo by phase."})
     body = r.json()
@@ -386,7 +402,8 @@ def test_grouped_bar_exact_fanout_zero_fills_cells(client):
     assert zero["supporting_nct_ids_complete"] is True
 
 
-def test_network_meta_reports_caps(monkeypatch, client):
+def test_network_meta_reports_caps(monkeypatch, client, set_plan):
+    set_plan(network_plan("sponsor_drug"))
     """30 sponsors × 30 drugs × 3 trials = 900 weight-3 edges → exceeds the 200 cap."""
     big_corpus = [
         _study(
@@ -408,7 +425,8 @@ def test_network_meta_reports_caps(monkeypatch, client):
     assert any("truncated" in w.lower() for w in meta["warnings"])
 
 
-def test_top_n_clips_network_edges_and_drops_orphan_nodes(monkeypatch, client):
+def test_top_n_clips_network_edges_and_drops_orphan_nodes(monkeypatch, client, set_plan):
+    set_plan(network_plan("sponsor_drug"))
     """Network output must honor request top_n (edges → top N by weight),
     and drop nodes whose only edges were clipped."""
     big_corpus = [
@@ -436,7 +454,8 @@ def test_top_n_clips_network_edges_and_drops_orphan_nodes(monkeypatch, client):
     assert weights == sorted(weights, reverse=True)
 
 
-def test_top_n_clips_high_cardinality_buckets(client):
+def test_top_n_clips_high_cardinality_buckets(client, set_plan):
+    set_plan(bar_plan("country"))
     """top_n=1 keeps only the highest-trial-count country."""
     r = client.post(
         "/analyze",
@@ -447,7 +466,8 @@ def test_top_n_clips_high_cardinality_buckets(client):
     assert body["visualization"]["data"][0]["country"] == "United States"
 
 
-def test_scatter_datum_has_uniform_citation_fields(client):
+def test_scatter_datum_has_uniform_citation_fields(client, set_plan):
+    set_plan(scatter_plan())
     r = client.post(
         "/analyze",
         json={"query": "Does enrollment correlate with trial duration?"},
@@ -460,7 +480,8 @@ def test_scatter_datum_has_uniform_citation_fields(client):
             assert k in d
 
 
-def test_scatter_display_cap_adds_warning(monkeypatch, client):
+def test_scatter_display_cap_adds_warning(monkeypatch, client, set_plan):
+    set_plan(scatter_plan())
     corpus = [
         _study(
             f"NCTSCAT{i:04d}",
@@ -485,7 +506,8 @@ def test_scatter_display_cap_adds_warning(monkeypatch, client):
     assert any("display-clipped to 3 of 12 points" in w for w in body["meta"]["warnings"])
 
 
-def test_network_edge_has_uniform_citation_fields(client):
+def test_network_edge_has_uniform_citation_fields(client, set_plan):
+    set_plan(network_plan("sponsor_drug"))
     r = client.post("/analyze", json={"query": "Show a network of sponsors and drugs."})
     body = r.json()
     assert body["visualization"]["type"] == "network_graph"
@@ -516,8 +538,10 @@ def test_small_enum_bar_uses_exact_fanout(monkeypatch, query, expected_dim):
         )
         for i in range(100)
     ]
-    monkeypatch.setattr(main_module, "CTGovClient",
-                        make_fake_client_class(corpus))
+    monkeypatch.setattr(main_module, "CTGovClient", make_fake_client_class(corpus))
+    monkeypatch.setattr(
+        main_module, "plan_query", plan_query_for(bar_plan(expected_dim))
+    )
     c = TestClient(main_module.app)
     r = c.post("/analyze", json={"query": query, "max_studies": 50})
     body = r.json()
@@ -561,6 +585,9 @@ def test_sponsor_top_n_uses_exact_fanout_not_sample_window(monkeypatch):
             return total
 
     monkeypatch.setattr(main_module, "CTGovClient", SkewedClient)
+    monkeypatch.setattr(
+        main_module, "plan_query", plan_query_for(bar_plan("lead_sponsor"))
+    )
     c = TestClient(main_module.app)
     r = c.post(
         "/analyze",
@@ -581,7 +608,8 @@ def test_sponsor_top_n_uses_exact_fanout_not_sample_window(monkeypatch):
         assert d["sampled"] is False
 
 
-def test_time_series_default_range_is_surfaced(client):
+def test_time_series_default_range_is_surfaced(client, set_plan):
+    set_plan(time_series_plan())
     """Time-series defaults (2010-current) must show in filters_applied
     + a warning, so the user can see the implicit scope."""
     r = client.post(
@@ -596,7 +624,8 @@ def test_time_series_default_range_is_surfaced(client):
                for w in body["meta"]["warnings"])
 
 
-def test_time_series_explicit_range_no_default_warning(client):
+def test_time_series_explicit_range_no_default_warning(client, set_plan):
+    set_plan(time_series_plan())
     r = client.post(
         "/analyze",
         json={
@@ -609,7 +638,8 @@ def test_time_series_explicit_range_no_default_warning(client):
                    for w in body["meta"]["warnings"])
 
 
-def test_network_truncation_surfaces_warning(monkeypatch, client):
+def test_network_truncation_surfaces_warning(monkeypatch, client, set_plan):
+    set_plan(network_plan("sponsor_drug"))
     """When the network is built from a sampled study set, the response
     must include a warning explaining that edge weights are lower bounds.
     Network has its own larger scan cap (CTGOV_NETWORK_SCAN_CAP=5000), so

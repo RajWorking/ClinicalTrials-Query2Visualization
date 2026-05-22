@@ -29,13 +29,19 @@ python3.13 -m venv .venv
 pip install -r requirements.txt
 
 # Then in either case:
-cp .env.example .env   # add OPENAI_API_KEY, or set STUB_LLM=1 to skip
+cp .env.example .env   # add your OPENROUTER_API_KEY
 ./run.sh               # serves http://localhost:8000
 ```
 
 `run.sh` looks for (in order) the conda env named `cheiron`, then a local
 `.venv`, then falls back to system python. Override the conda env name
 with `CONDA_ENV=other ./run.sh`.
+
+The planner routes through **OpenRouter** using the OpenAI-compatible SDK.
+Set `OPENROUTER_API_KEY` in `.env`. The default model is
+`openai/gpt-4o-mini`; override with `OPENROUTER_MODEL`. Any model that
+supports OpenAI structured outputs (`response_format={"type":"json_schema",...}`)
+will work.
 
 Open `http://localhost:8000/` in a browser, or POST to `/analyze`:
 
@@ -44,17 +50,6 @@ curl -sS -X POST http://localhost:8000/analyze \
   -H 'content-type: application/json' \
   -d '{"query":"How has the number of trials for this drug changed each year?","drug_name":"Pembrolizumab"}' \
   | python3 -m json.tool
-```
-
-### Stub mode
-
-Set `STUB_LLM=1` to bypass OpenAI entirely. The planner uses hand-crafted
-plans for the example query categories (time trends, distributions,
-comparisons, geography, networks, histograms, and scatter plots). This lets
-graders run the full pipeline end-to-end without an OpenAI key.
-
-```bash
-STUB_LLM=1 ./run.sh
 ```
 
 ### Tests
@@ -66,19 +61,19 @@ python -m scripts.smoke_analyze # live end-to-end /analyze on all 7 example quer
 python -m scripts.smoke_analyze --write # refresh examples/*.response.json
 ```
 
-142 tests cover every aggregation builder, the stub planner's classification
-(including stopword-aware condition extraction and X-vs-Y axis routing for
-phase / year / status / country / sponsor class), schema validation
+The test suite covers every aggregation builder, deterministic planner
+validation helpers, schema validation
 (phase/status/sponsor-class/study-type/sex/intervention-type synonyms,
 year bounds, discriminated visualization spec, typed per-viz datum rows),
 end-to-end `/analyze` integration via a mocked CT.gov client, the OpenAI
-planner path with a fake SDK (happy path / repair retry / fallback),
-small-enum exact fan-out across `sponsor_class` / `study_type` / `sex` /
-`intervention_type` (parametrized), candidate-discovery exact fan-out for
-sponsor / condition / intervention top-N, salt-form canonicalization and
-MeSH artifact filtering for the network builder, top-N clipping (bar and
-network), default-time-range surfacing, network-truncation warnings, and a
-recorded CT.gov payload played through the real httpx client. The
+planner path with a fake SDK (happy path / malformed-output repair retry /
+provider-error propagation), small-enum exact fan-out across
+`sponsor_class` / `study_type` / `sex` / `intervention_type`
+(parametrized), candidate-discovery exact fan-out for sponsor / condition /
+intervention top-N, salt-form canonicalization and MeSH artifact filtering
+for the network builder, top-N clipping (bar and network),
+default-time-range surfacing, network-truncation warnings, and a recorded
+CT.gov payload played through the real httpx client. The
 `smoke_ctgov` script diagnoses transport issues (e.g. CDN-side `403`s);
 the `smoke_analyze` script runs each canonical example against the
 live API and prints actual vs. expected viz types. Pass `--write` to
@@ -112,9 +107,8 @@ Python. Numbers are never hallucinated.
 | Stage      | Module                  | What it does                                                                 |
 |------------|-------------------------|------------------------------------------------------------------------------|
 | Route      | `app/main.py`           | FastAPI setup, error mapping, `/analyze` orchestration                        |
-| Plan       | `app/planner.py`        | OpenAI call/repair/fallback and `STUB_LLM=1` composition                     |
-| Extract    | `app/nl_extract.py`     | Deterministic stub-mode condition/year/axis/network routing helpers          |
-| Validate   | `app/plan_verifier.py`  | Post-plan deterministic intent checks and off-topic safe-default guard       |
+| Plan       | `app/planner.py`        | OpenRouter planner call, malformed-output repair, provider-error propagation |
+| Validate   | `app/plan_verifier.py`  | Hook for deterministic post-plan checks (pass-through until logic is added)  |
 | Schema     | `app/planner_schema.py` | OpenAI structured-output prompt + strict JSON schema                         |
 | Fetch      | `app/ctgov.py`          | Translates `Filters` → v2 API params, paginates, normalizes to flat dicts    |
 | Execute    | `app/paths.py`          | Selects exact/sampled execution path and returns `PathOutcome`                |
@@ -264,7 +258,7 @@ Seven canonical queries, with captured input/output JSON pairs, live in
 Reproduce them with:
 
 ```bash
-STUB_LLM=1 ./run.sh &
+./run.sh &
 for f in examples/*.request.json; do
   curl -sS -X POST http://localhost:8000/analyze \
     -H 'content-type: application/json' --data-binary @"$f"
@@ -315,16 +309,12 @@ to CT.gov enum filters (`phase`, `status`, `sponsor_class`, `study_type`,
 such as "Phase 3", "industry-sponsored", "observational", "female-only",
 and "biologic trials".
 
-**Stub mode.** A heuristic planner ships with the code so the pipeline
-can be evaluated without an OpenAI key. It also guards the test suite
-against LLM nondeterminism.
-
 **Exact counts where possible, sampled-and-labelled otherwise.** Each
 visualization request is dispatched to one of eight *path strategies*
 (`_path_year_fanout`, `_path_exact_bar`, `_path_high_card_bar`,
-`_path_exact_country_bar`, `_path_grouped_bar_cross`,
-`_path_grouped_compare_exact`, `_path_grouped_compare_sampled`,
-`_path_generic`) — each returns a `PathOutcome`, then `responses.py` runs
+`_path_grouped_bar_cross`, `_path_grouped_compare_exact`,
+`_path_grouped_compare_sampled`, `_path_generic`) — each returns a
+`PathOutcome`, then `responses.py` runs
 the same post-processing on whatever the chosen path produced.
 
 - `phase`, `overall_status`, `sponsor_class`, `study_type`, `sex`, and
@@ -336,11 +326,7 @@ the same post-processing on whatever the chosen path produced.
   enumerate buckets up-front. Exact year time-series responses include
   explicit zero-count rows for empty years, and exact grouped comparisons
   include zero-count cells for every compared series × enum bucket.
-- For **country** group_by we enumerate a fixed CT.gov-compatible country
-  list and run one `countTotal=true` query per country. Shown country
-  counts are exact and can find a true leader outside the first result
-  window; citation IDs on each country are still a small sample.
-- For **sponsor / condition / intervention name** group_by we
+- For **country / sponsor / condition / intervention name** group_by we
   candidate-discover from a broader high-cardinality scan window, then fan out one
   `countTotal=true` per discovered candidate — so the trial counts on
   shown buckets are *exact* (no sampling), but a candidate that appears
@@ -431,15 +417,10 @@ edges were clipped are dropped from the response. `meta.edges_returned` /
   the httpx attempt entirely. This avoids paying the 403 RTT on every
   fan-out cell when the local CDN edge is unfriendly to httpx; the flag
   resets on process restart.
-- **Planner repair.** If OpenAI fails or returns malformed output, the
-  request retries once; if it still fails, the planner falls back to a
-  safe default plan (year trend if a year filter is set, else phase
-  distribution) and surfaces the reason in `meta.warnings`. The
-  endpoint never `500`s on planning failures.
-- **Answerability guard.** Plainly off-topic requests with no structured
-  trial filters (for example weather or stock-price questions) are routed
-  to the same safe-default response and warning path instead of presenting
-  an inferred plan as confident.
+- **Planner repair.** If the model returns malformed JSON or a schema-invalid
+  `QueryPlan`, the request retries once with an explicit repair prompt.
+  Provider/API failures such as authentication errors are surfaced as
+  planning errors; the service does not fabricate a default visualization.
 
 ## Tuning knobs (env vars)
 
@@ -447,8 +428,11 @@ edges were clipped are dropped from the response. `meta.edges_returned` /
   raise for more exact counts on generic sampled paths at the cost of
   latency.
 - `CTGOV_HIGH_CARD_SCAN_CAP` (default `10000`) — candidate-discovery scan
-  window for high-cardinality bar charts (`lead_sponsor`, `condition`,
-  `intervention_name`) before per-candidate exact `countTotal` fan-out.
+  window for high-cardinality bar charts (`country`, `lead_sponsor`,
+  `condition`, `intervention_name`) before per-candidate exact
+  `countTotal` fan-out.
+- `CTGOV_HIGH_CARD_CANDIDATE_CAP` (default `100`) — maximum discovered
+  candidates to fan out exactly on high-cardinality bar charts.
 - `CTGOV_NUMERIC_SCAN_CAP` (default `10000`) — applies to `histogram`
   and `scatter_plot` so numeric distributions cover a broad sample of
   matched trials.
@@ -461,7 +445,10 @@ edges were clipped are dropped from the response. `meta.edges_returned` /
   `256`) — in-process TTL cache for repeat queries.
 - `CTGOV_CONCURRENCY` (default `8`) — semaphore on in-flight CT.gov
   requests, prevents fan-out paths from saturating upstream.
-- `OPENAI_MODEL` (default `gpt-4o-mini`), `STUB_LLM=1` to bypass OpenAI.
+- `OPENROUTER_API_KEY` — required for live LLM calls (`OPENAI_API_KEY`
+  is accepted as a fallback). `OPENROUTER_MODEL` (default
+  `openai/gpt-4o-mini`), `OPENROUTER_BASE_URL` (default
+  `https://openrouter.ai/api/v1`).
 
 ## Limitations and future work
 
@@ -471,12 +458,7 @@ edges were clipped are dropped from the response. `meta.edges_returned` /
   over those dims. Each dim's bucket list is enumerated up front; one
   tiny `countTotal=true` request per bucket in parallel. Empty years and
   empty exact comparison cells are returned as explicit zero-count rows.
-- **Country rankings use fixed-list exact fan-out.** We enumerate common
-  CT.gov country names and run one `countTotal=true` query per country,
-  so the shown top-N reflects exact counts for that list rather than the
-  first page of studies. A country outside the fixed list will not appear
-  unless it was supplied as the request-level `country` filter.
-- **Sponsor / condition / intervention-name top-N rankings use
+- **Country / sponsor / condition / intervention-name top-N rankings use
   candidate-discovery exact fan-out.** A sample window of up to
   `CTGOV_HIGH_CARD_SCAN_CAP` trials seeds the candidate set, then each
   discovered candidate gets its own `countTotal=true` request — so the
@@ -485,16 +467,16 @@ edges were clipped are dropped from the response. `meta.edges_returned` /
   the candidate list. A `candidate_set_sampled` warning is emitted in
   that case.
 - **Free-text drug/condition matching.** We pass user-provided
-  drug/condition strings (after a small alias normalization step,
-  `app/aliases.py`) straight through to `query.intr` / `query.cond`. A
-  full MeSH lookup would tighten precision further.
-- **English-only planner prompts.** The system prompt, few-shot
-  examples, and stub heuristics are English.
+  drug/condition strings straight through to `query.intr` / `query.cond`.
+  A full MeSH lookup would tighten precision further.
+- **English-only planner prompts.** The system prompt and few-shot examples
+  are English.
 - **No auth.** Intended for local evaluation; add an API key middleware
   before deploying. The CT.gov client *does* enforce a per-process
   concurrency limit and an in-process TTL cache.
-- **Single-call OpenAI integration.** One repair retry on validation
-  failure, then a deterministic safe-default plan. No streaming.
+- **Single-call OpenRouter integration.** One repair retry on
+  schema-validation failure. Provider/API failures are returned as errors.
+  No streaming.
 
 ---
 
@@ -507,13 +489,12 @@ app/
   paths.py            /analyze path selection and execution strategies
   exact_counts.py     countTotal fan-out helpers
   responses.py        response post-processing + AnalyzeResponse assembly
-  constants.py        shared enum values, labels, country buckets
+  constants.py        shared enum values and labels
   drugs.py            drug canonicalization + network drug extraction
   schemas.py          Pydantic request/response/plan models
-  planner.py          OpenAI planner orchestration + stub mode composition
-  planner_schema.py   planner prompt + strict OpenAI JSON schema
-  nl_extract.py       deterministic NL extraction/routing helpers
-  plan_verifier.py    planner intent repair + off-topic guard
+  planner.py          OpenRouter planner call + repair retry
+  planner_schema.py   planner system prompt + strict JSON schema
+  plan_verifier.py    post-plan validation hook
   ctgov.py            ClinicalTrials.gov v2 client + study normalizer
   aggregate.py        build_bar / build_grouped_bar / build_time_series / build_histogram / build_scatter / build_network
   citations.py        excerpt selection + cite() helper
@@ -524,7 +505,7 @@ app/
 examples/             7 captured request/response JSON pairs
 tests/
   test_aggregate.py   unit tests for every builder
-  test_planner.py     stub-mode classification tests
+  test_openai_planner.py OpenRouter planner integration tests with fake SDK
 requirements.txt
 run.sh                convenience launcher (loads .env, starts uvicorn)
 .env.example

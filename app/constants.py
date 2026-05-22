@@ -17,6 +17,10 @@ NUMERIC_FIELDS = ("enrollment_count", "duration_months", "start_year")
 NETWORK_KINDS = ("sponsor_drug", "drug_condition", "drug_drug", "site_drug")
 
 
+# CT.gov v2 API `Phase` enum (field: Phase).
+# EARLY_PHASE1 covers first-in-human exploratory studies that precede a
+# formal Phase 1; NA is used for non-interventional and certain expanded
+# access records where phase doesn't apply.
 PHASE_LABELS = {
     "PHASE1": "Phase 1",
     "PHASE2": "Phase 2",
@@ -27,6 +31,9 @@ PHASE_LABELS = {
 }
 PHASE_ENUM = tuple(PHASE_LABELS)
 PHASE_VALUES = set(PHASE_ENUM)
+# Roman numerals (I–IV) are the traditional FDA/clinical convention;
+# CT.gov's own UI displays Arabic numerals. Both appear in literature so
+# the plan verifier accepts either form.
 PHASE_VARIANTS = {
     "PHASE1": ("Phase 1", "Phase I"),
     "PHASE2": ("Phase 2", "Phase II"),
@@ -50,6 +57,10 @@ PHASE_SYNONYMS = {
 }
 
 
+# CT.gov v2 API `OverallStatus` enum (field: OverallStatus).
+# The last five values (AVAILABLE through WITHHELD) are only used for
+# expanded access records (compassionate/emergency use outside of trials),
+# not for standard trial registrations.
 STATUS_LABELS = {
     "RECRUITING": "Recruiting",
     "NOT_YET_RECRUITING": "Not yet recruiting",
@@ -68,6 +79,10 @@ STATUS_LABELS = {
 }
 STATUS_ENUM = tuple(STATUS_LABELS)
 STATUS_VALUES = set(STATUS_ENUM)
+# Subset exposed to the LLM planner: omits the five expanded access statuses
+# (AVAILABLE, NO_LONGER_AVAILABLE, TEMPORARILY_NOT_AVAILABLE,
+# APPROVED_FOR_MARKETING, WITHHELD) which appear only on compassionate-use
+# records and would add noise to NL query planning.
 PLANNER_STATUS_ENUM = (
     "RECRUITING", "NOT_YET_RECRUITING", "ACTIVE_NOT_RECRUITING",
     "COMPLETED", "TERMINATED", "WITHDRAWN", "SUSPENDED",
@@ -75,6 +90,14 @@ PLANNER_STATUS_ENUM = (
 )
 
 
+# CT.gov v2 API `LeadSponsorClass` enum (field: LeadSponsorClass).
+# Classification is assigned by NLM/CT.gov based on the lead sponsor's
+# organization type: INDUSTRY = commercial pharma/biotech; NIH = National
+# Institutes of Health specifically; FED = other US federal agencies (DoD,
+# VA, etc.); OTHER_GOV = non-US government agencies; INDIV = individual
+# investigators; NETWORK = clinical research networks (e.g., ECOG-ACRIN,
+# NCI cooperative groups); AMBIG = classification uncertain; OTHER =
+# academic, non-profit, or other entities not fitting the above.
 SPONSOR_CLASS_LABELS = {
     "INDUSTRY": "Industry",
     "NIH": "NIH",
@@ -111,6 +134,11 @@ SPONSOR_CLASS_SYNONYMS = {
 }
 
 
+# CT.gov v2 API `StudyType` enum (field: StudyType).
+# INTERVENTIONAL = participants assigned to an intervention (standard clinical
+# trial); OBSERVATIONAL = participants observed without an assigned
+# intervention; EXPANDED_ACCESS = compassionate/emergency use outside of a
+# clinical trial.
 STUDY_TYPE_LABELS = {
     "INTERVENTIONAL": "Interventional",
     "OBSERVATIONAL": "Observational",
@@ -129,6 +157,8 @@ STUDY_TYPE_SYNONYMS = {
 }
 
 
+# CT.gov v2 API `Sex` enum (field: Sex, representing eligibility sex).
+# Three values: ALL (no sex restriction on eligibility), FEMALE, MALE.
 SEX_LABELS = {
     "ALL": "All",
     "FEMALE": "Female",
@@ -151,6 +181,8 @@ SEX_SYNONYMS = {
 }
 
 
+# CT.gov v2 API `InterventionType` enum (field: InterventionType).
+# All eleven values as defined in the CT.gov data model.
 INTERVENTION_TYPE_LABELS = {
     "DRUG": "Drug",
     "BIOLOGICAL": "Biological",
@@ -192,6 +224,12 @@ INTERVENTION_TYPE_SYNONYMS = {
 }
 
 
+# Dimensions whose complete set of values is a closed enum defined by CT.gov.
+# For these dims the paths layer issues one countTotal API call per bucket
+# value instead of paginating all matching studies — exact counts at O(buckets)
+# API calls rather than O(pages). Open-ended dims (lead_sponsor, country,
+# condition, intervention_name) are ineligible because their value spaces are
+# unbounded.
 EXACT_COUNT_DIMS: dict[str, tuple[str, list[tuple[str, str]]]] = {
     "phase": ("phase", [(v, PHASE_LABELS[v]) for v in PHASE_ENUM]),
     "overall_status": (
@@ -213,21 +251,3 @@ EXACT_COUNT_DIMS: dict[str, tuple[str, list[tuple[str, str]]]] = {
     ),
 }
 
-
-COUNTRY_BUCKETS = [
-    "Argentina", "Australia", "Austria", "Belgium", "Brazil", "Bulgaria",
-    "Canada", "Chile", "China", "Colombia", "Croatia", "Czechia", "Denmark",
-    "Egypt", "Finland", "France", "Germany", "Greece", "Hong Kong", "Hungary",
-    "India", "Ireland", "Israel", "Italy", "Japan", "Korea, Republic of",
-    "Malaysia", "Mexico", "Netherlands", "New Zealand", "Norway", "Poland",
-    "Portugal", "Romania", "Russian Federation", "Singapore", "South Africa",
-    "Spain", "Sweden", "Switzerland", "Taiwan", "Thailand", "Turkey",
-    "Ukraine", "United Kingdom", "United States",
-    "Algeria", "Bangladesh", "Belarus", "Bosnia and Herzegovina", "Costa Rica",
-    "Cyprus", "Dominican Republic", "Estonia", "Georgia", "Iceland",
-    "Indonesia", "Iran, Islamic Republic of", "Jordan", "Kenya", "Kuwait",
-    "Latvia", "Lebanon", "Lithuania", "Luxembourg", "Malta", "Morocco",
-    "Pakistan", "Panama", "Peru", "Philippines", "Puerto Rico", "Qatar",
-    "Saudi Arabia", "Serbia", "Slovakia", "Slovenia", "Sri Lanka",
-    "United Arab Emirates", "Uruguay", "Viet Nam",
-]

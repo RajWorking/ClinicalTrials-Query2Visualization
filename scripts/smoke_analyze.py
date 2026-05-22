@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Live /analyze smoke test.
 
-Boots the FastAPI app in-process (no uvicorn), forces STUB_LLM mode, and
-sends each canonical example query against the real ClinicalTrials.gov
-API. Prints the visualization type and a short result summary per query.
+Boots the FastAPI app in-process (no uvicorn) and sends each canonical
+example query against the real ClinicalTrials.gov API. Requires OpenAI or
+OpenRouter planner credentials.
+Prints the visualization type and a short result summary per query.
 
 Run:  python -m scripts.smoke_analyze
       python -m scripts.smoke_analyze --write
@@ -13,14 +14,11 @@ Exit code 0 if all queries return 200 with the expected viz type.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from argparse import ArgumentParser
 from pathlib import Path
 
-os.environ["STUB_LLM"] = "1"  # avoid OpenAI dep for the smoke
-
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
 from app.main import app  # noqa: E402
 

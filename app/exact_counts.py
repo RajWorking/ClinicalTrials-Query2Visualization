@@ -7,15 +7,18 @@ from typing import Any, Optional
 
 from .aggregate import _values_for_dim
 from .citations import cite_for
-from .constants import COUNTRY_BUCKETS, EXACT_COUNT_DIMS
+from .constants import EXACT_COUNT_DIMS
 from .ctgov import CTGovClient
 from .schemas import Filters
 
 
-# High-cardinality dims use candidate discovery from a sample window, then
-# exact countTotal fan-out for each discovered candidate.
+# Open-ended dims whose value sets are unbounded (unlike EXACT_COUNT_DIMS).
+# Strategy: scan a sample window to discover candidate values, then fire one
+# exact countTotal query per candidate. Counts are exact for discovered values;
+# values that appear only outside the sample window are omitted with a warning.
 HIGH_CARDINALITY_FANOUT_DIMS: dict[str, str] = {
     "lead_sponsor": "sponsor",
+    "country": "country",
     "condition": "condition",
     "intervention_name": "drug_name",
 }
@@ -201,12 +204,3 @@ async def _exact_year_counts(
     ]
     return data, sum(d["trial_count"] for d in data)
 
-
-async def _exact_country_counts(
-    client: CTGovClient, base_filters: Filters,
-) -> tuple[list[dict[str, Any]], int, int]:
-    countries = [base_filters.country] if base_filters.country else COUNTRY_BUCKETS
-    return await _exact_fanout_counts(
-        client, base_filters, "country", [(c, c) for c in countries if c],
-        "country", sort_key=lambda d: (-d["trial_count"], d["country"]),
-    )

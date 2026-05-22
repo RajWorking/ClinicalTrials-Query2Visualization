@@ -14,7 +14,6 @@ from .ctgov import CTGovClient
 from .exact_counts import (
     HIGH_CARDINALITY_FANOUT_DIMS,
     _exact_bucket_counts,
-    _exact_country_counts,
     _exact_grouped_compare,
     _exact_high_cardinality_counts,
     _exact_year_counts,
@@ -40,7 +39,7 @@ class PathOutcome(NamedTuple):
     warnings: tuple[str, ...] = ()
 
 
-def _finalize_plan(plan: QueryPlan) -> tuple[QueryPlan, list[str]]:
+def finalize_plan(plan: QueryPlan) -> tuple[QueryPlan, list[str]]:
     warnings: list[str] = []
     if (plan.visualization_type == "time_series"
             and plan.aggregation.group_by == "year"):
@@ -148,9 +147,11 @@ async def _path_high_card_bar(
     filter_field = HIGH_CARDINALITY_FANOUT_DIMS[plan.aggregation.group_by]
     sample_cap = int(os.environ.get("CTGOV_HIGH_CARD_SCAN_CAP", "10000"))
     sample_size = max(req.max_studies, sample_cap)
+    candidate_cap = int(os.environ.get("CTGOV_HIGH_CARD_CANDIDATE_CAP", "100"))
     data, total, candidates_sampled = await _exact_high_cardinality_counts(
         client, plan.filters, filter_field,
         plan.aggregation.group_by, sample_size=sample_size,
+        candidate_cap=candidate_cap,
     )
     warnings: list[str] = []
     if candidates_sampled:
@@ -166,19 +167,6 @@ async def _path_high_card_bar(
         _chart_built(data, plan.aggregation.group_by),
         total, total, False, warnings=tuple(warnings),
     )
-
-
-async def _path_exact_country_bar(
-    client: CTGovClient, plan: QueryPlan, req: AnalyzeRequest,
-) -> PathOutcome:
-    data, total, bucket_memberships = await _exact_country_counts(
-        client, plan.filters,
-    )
-    built = _chart_built(
-        data, "country", extras={"_bucket_memberships": bucket_memberships},
-    )
-    return PathOutcome(built, total, total, False)
-
 
 async def _path_grouped_bar_cross(
     client: CTGovClient, plan: QueryPlan, req: AnalyzeRequest,
@@ -317,11 +305,6 @@ _PATH_RULES: list[tuple[Any, Any, Any]] = [
         _path_high_card_bar, lambda _p: {},
     ),
     (
-        lambda p: (p.visualization_type == "bar_chart"
-                   and p.aggregation.group_by == "country"),
-        _path_exact_country_bar, lambda _p: {},
-    ),
-    (
         lambda p: (p.visualization_type == "grouped_bar_chart"
                    and p.aggregation.series and p.aggregation.group_by
                    and not p.aggregation.series_values),
@@ -341,7 +324,7 @@ _PATH_RULES: list[tuple[Any, Any, Any]] = [
 ]
 
 
-def _select_path(plan: QueryPlan) -> tuple[Any, dict[str, Any]]:
+def select_path(plan: QueryPlan) -> tuple[Any, dict[str, Any]]:
     for predicate, handler, extras_fn in _PATH_RULES:
         if predicate(plan):
             return handler, extras_fn(plan)

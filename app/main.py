@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .ctgov import CTGovClient, CTGovError
-from .paths import PathOutcome, _finalize_plan, _select_path
+from .paths import PathOutcome, select_path, finalize_plan
 from .plan_verifier import PlannerError
 from .planner import plan_query
 from .responses import build_analyze_response
@@ -56,18 +56,13 @@ async def root() -> Any:
 async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     try:
         plan: QueryPlan = plan_query(req)
-    except PlannerError as e:  # planner failure (very rare; planner has its own fallback)
+    except PlannerError as e:
         raise HTTPException(502, f"Query planning failed: {e}") from e
 
-    plan, warnings = _finalize_plan(plan)
-    if plan.notes and plan.notes.startswith("fallback:"):
-        warnings.insert(
-            0,
-            "Query understanding fell back to a safe default. " + plan.notes,
-        )
+    plan, warnings = finalize_plan(plan)
 
     async with CTGovClient() as client:
-        handler, extras = _select_path(plan)
+        handler, extras = select_path(plan)
         outcome: PathOutcome = await handler(client, plan, req, **extras)
 
     return build_analyze_response(

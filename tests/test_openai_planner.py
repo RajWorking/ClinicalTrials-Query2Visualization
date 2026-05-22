@@ -4,29 +4,24 @@ Verifies:
   - the SDK call shape (system prompt + user payload + json_schema)
   - the response is validated through QueryPlan
   - first-attempt failure triggers a repair retry with stricter prompt
-  - persistent failure falls through to _safe_default_plan
+  - persistent failure raises PlannerError (no silent fallback)
 """
 from __future__ import annotations
 
 import json
-import os
 from types import SimpleNamespace
 
 import pytest
 
 from app import planner
+from app.plan_verifier import PlannerError
 from app.schemas import AnalyzeRequest
-
-
-@pytest.fixture(autouse=True)
-def disable_stub(monkeypatch):
-    monkeypatch.delenv("STUB_LLM", raising=False)
 
 
 @pytest.fixture
 def fake_openai(monkeypatch):
     """Builds a configurable fake OpenAI client and installs it in the SDK."""
-    state = {"calls": [], "responses": []}
+    state = {"calls": [], "responses": [], "client_kwargs": []}
 
     class FakeCompletions:
         def create(self, **kwargs):
@@ -42,7 +37,8 @@ def fake_openai(monkeypatch):
         completions = FakeCompletions()
 
     class FakeOpenAI:
-        def __init__(self, *_, **__):
+        def __init__(self, *_, **kwargs):
+            state["client_kwargs"].append(kwargs)
             self.chat = FakeChat()
 
     # Patch the SDK class lookup inside _openai_plan.
@@ -92,6 +88,20 @@ def test_openai_planner_happy_path(fake_openai):
     assert user_payload["query"] == "phases for pembrolizumab"
 
 
+def test_openrouter_api_key_and_base_url(fake_openai, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
+    fake_openai["responses"].append(VALID_PLAN_JSON)
+
+    planner.plan_query(AnalyzeRequest(query="phases for pembrolizumab"))
+
+    [client_kwargs] = fake_openai["client_kwargs"]
+    assert client_kwargs["api_key"] == "sk-or-v1-test"
+    assert client_kwargs["base_url"] == "https://openrouter.ai/api/v1"
+    [call] = fake_openai["calls"]
+    assert call["model"] == "openai/gpt-4o-mini"
+
+
 def test_openai_planner_repair_on_first_failure(fake_openai):
     """First call returns malformed JSON; repair attempt fixes it."""
     fake_openai["responses"].extend([
@@ -103,21 +113,27 @@ def test_openai_planner_repair_on_first_failure(fake_openai):
     # Second call must include repair_hint in system prompt.
     sys_prompt_2 = fake_openai["calls"][1]["messages"][0]["content"]
     assert "REPAIR ATTEMPT" in sys_prompt_2
-    assert "PHASE3" in sys_prompt_2  # canonical-value reminder is in the hint
+    assert "PHASE3" in sys_prompt_2  # canonical-value reminder is in the static hint
 
 
-def test_openai_planner_two_failures_falls_back(fake_openai):
-    """Two failures → _safe_default_plan kicks in, no exception."""
+def test_openai_planner_two_failures_raises(fake_openai):
+    """Two invalid model payloads raise PlannerError — no silent fallback."""
     fake_openai["responses"].extend([
-        RuntimeError("api down"),
-        RuntimeError("api still down"),
+        "{not json",
+        "{still not json",
     ])
-    plan = planner.plan_query(
-        AnalyzeRequest(query="something weird", start_year=2020)
-    )
-    # Default for "year filter set" is time_series.
-    assert plan.visualization_type == "time_series"
-    assert plan.notes and plan.notes.startswith("fallback:")
+    with pytest.raises(PlannerError, match="invalid plan"):
+        planner.plan_query(AnalyzeRequest(query="something weird", start_year=2020))
+
+
+def test_openai_provider_error_raises_without_mock_response(fake_openai):
+    """Provider/API failures, e.g. 401s, must not fall back to mock data."""
+    fake_openai["responses"].append(RuntimeError("401 unauthorized"))
+
+    with pytest.raises(PlannerError, match="401 unauthorized"):
+        planner.plan_query(AnalyzeRequest(query="phases for pembrolizumab"))
+
+    assert len(fake_openai["calls"]) == 1
 
 
 def test_filters_phase_validation_rejects_garbage_from_planner():

@@ -40,16 +40,6 @@ def test_normalize_pulls_expected_fields_from_real_payload():
     assert all("name" in i for i in flat["interventions"])
 
 
-def test_filters_to_params_normalizes_brand_name():
-    """Filters with 'Keytruda' should hit the API as 'pembrolizumab'."""
-    p = filters_to_params(Filters(drug_name="Keytruda"))
-    assert p["query.intr"].lower() == "pembrolizumab"
-
-
-def test_filters_to_params_normalizes_condition_alias():
-    p = filters_to_params(Filters(condition="NSCLC"))
-    assert "non-small cell lung cancer" in p["query.cond"].lower()
-
 
 def test_filters_to_params_phase_advanced_filter():
     p = filters_to_params(Filters(phase="PHASE3"))
@@ -98,7 +88,7 @@ async def test_search_studies_via_mocked_transport():
     )
     async with CTGovClient(client=client) as c:
         studies, total = await c.search_studies(
-            Filters(drug_name="Keytruda"), max_studies=3, page_size=3,
+            Filters(drug_name="Pembrolizumab"), max_studies=3, page_size=3,
         )
     assert total == 2847
     assert len(studies) == 3

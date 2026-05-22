@@ -6,9 +6,7 @@ from typing import Any, Optional
 
 from .citations import cite, cite_for, cite_network_edge
 from .constants import PHASE_LABELS, STATUS_LABELS
-from .drugs import (
-    DRUG_NAME_BLOCKLIST, canonicalize_drug, drug_names as _drug_names,
-)
+from .drugs import canonicalize_drug, drug_names as _drug_names
 from .schemas import Aggregation, QueryPlan
 
 
